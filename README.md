@@ -85,3 +85,4 @@ If the scan finds nothing:
 - BLE discovery is matched by Meshtastic device name or device address.
 - Auth is optional. If `MESHTASTIC_API_TOKEN` is set, send `Authorization: Bearer <token>` or `X-Tater-Token: <token>`.
 - v1 focuses on text messages and connection state. Telemetry and richer packet types can be layered in later.
+- `MESHTASTIC_SHUTDOWN_TIMEOUT_SECONDS` controls how long the bridge waits for BLE cleanup before continuing shutdown if the Bluetooth stack is hung.

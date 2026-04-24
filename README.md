@@ -1,3 +1,14 @@
+<p align="center">
+  <img 
+    src="https://github.com/user-attachments/assets/55e2f607-1e44-4937-8a72-3352520eb272" 
+    alt="screenshot"
+    width="300"
+  />
+</p>
+<h3 align="center">
+  <a href="https://taterassistant.com">taterassistant.com</a>
+</h3>
+
 # Tater Meshtastic Bridge
 
 `Tater Meshtastic Bridge` is a small host-side service that keeps Meshtastic BLE transport out of the main Tater app.

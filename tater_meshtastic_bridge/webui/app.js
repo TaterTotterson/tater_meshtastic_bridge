@@ -29,6 +29,8 @@ const state = {
   pollTimer: 0,
   loading: false,
   lastLoadedAt: "",
+  configDrafts: {},
+  configDirty: {},
 };
 
 const ROOT_PATH = (() => {
@@ -81,6 +83,202 @@ function prettyJson(value) {
   } catch {
     return "{}";
   }
+}
+
+function deepClone(value, fallback = {}) {
+  try {
+    return JSON.parse(JSON.stringify(value ?? fallback));
+  } catch {
+    return fallback;
+  }
+}
+
+function labelizeName(value) {
+  return String(value || "")
+    .trim()
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function configDraftKey(scope, section) {
+  return `${String(scope || "").trim()}:${String(section || "").trim()}`;
+}
+
+function getConfigDraft(scope, section, fallback = {}) {
+  const key = configDraftKey(scope, section);
+  if (!Object.prototype.hasOwnProperty.call(state.configDrafts, key)) {
+    state.configDrafts[key] = deepClone(fallback, {});
+  }
+  return state.configDrafts[key];
+}
+
+function syncConfigDrafts(config) {
+  const seen = new Set();
+  ["local", "module"].forEach((scope) => {
+    Object.entries(config?.[scope] || {}).forEach(([section, value]) => {
+      const key = configDraftKey(scope, section);
+      seen.add(key);
+      if (!state.configDirty[key]) {
+        state.configDrafts[key] = deepClone(value, {});
+      }
+    });
+  });
+  (state.data.channels || []).forEach((channel) => {
+    const section = String(channel?.index ?? "").trim();
+    if (!section) {
+      return;
+    }
+    const key = configDraftKey("channel", section);
+    seen.add(key);
+    if (!state.configDirty[key]) {
+      state.configDrafts[key] = deepClone(channel?.raw || {}, {});
+    }
+  });
+  Object.keys(state.configDrafts).forEach((key) => {
+    if (!seen.has(key) && !state.configDirty[key]) {
+      delete state.configDrafts[key];
+      delete state.configDirty[key];
+    }
+  });
+}
+
+function getChannelBySection(section) {
+  return (state.data.channels || []).find((channel) => String(channel?.index ?? "") === String(section ?? "")) || null;
+}
+
+function getConfigSchema(scope, section) {
+  if (scope === "channel") {
+    return getChannelBySection(section)?.schema || null;
+  }
+  return state.data.config?.schemas?.[scope]?.[section] || null;
+}
+
+function getConfigSourceValue(scope, section) {
+  if (scope === "channel") {
+    return getChannelBySection(section)?.raw || {};
+  }
+  return state.data.config?.[scope]?.[section] || {};
+}
+
+function defaultValueForSchema(schema) {
+  if (!schema || typeof schema !== "object") {
+    return "";
+  }
+  if (schema.kind === "message") {
+    const out = {};
+    (schema.fields || []).forEach((field) => {
+      out[field.name] = defaultValueForSchema(field);
+    });
+    return out;
+  }
+  if (schema.kind === "array") {
+    return [];
+  }
+  if (schema.kind === "map") {
+    return {};
+  }
+  if (schema.kind === "bool") {
+    return Boolean(schema.default);
+  }
+  if (schema.kind === "int" || schema.kind === "float") {
+    return Number(schema.default || 0);
+  }
+  if (schema.kind === "enum") {
+    return schema.default || schema.options?.[0]?.value || "";
+  }
+  return schema.default ?? "";
+}
+
+function getValueAtPath(root, path, fallback = undefined) {
+  let cursor = root;
+  for (const segment of path || []) {
+    if (cursor === undefined || cursor === null) {
+      return fallback;
+    }
+    cursor = cursor[segment];
+  }
+  return cursor === undefined ? fallback : cursor;
+}
+
+function ensureContainer(nextSegment) {
+  return typeof nextSegment === "number" ? [] : {};
+}
+
+function setValueAtPath(root, path, value) {
+  if (!Array.isArray(path) || !path.length) {
+    return;
+  }
+  let cursor = root;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const segment = path[index];
+    const nextSegment = path[index + 1];
+    if (cursor[segment] === undefined || cursor[segment] === null) {
+      cursor[segment] = ensureContainer(nextSegment);
+    }
+    cursor = cursor[segment];
+  }
+  cursor[path[path.length - 1]] = value;
+}
+
+function removeArrayItem(root, fieldPath, index) {
+  const arrayValue = getValueAtPath(root, fieldPath, []);
+  if (!Array.isArray(arrayValue)) {
+    return;
+  }
+  arrayValue.splice(index, 1);
+}
+
+function resolveSchemaNode(schema, path) {
+  let node = schema;
+  for (const segment of path || []) {
+    if (!node || typeof node !== "object") {
+      return null;
+    }
+    if (node.kind === "message") {
+      node = (node.fields || []).find((field) => field.name === segment) || null;
+      continue;
+    }
+    if (node.kind === "array") {
+      node = node.item_schema || null;
+      continue;
+    }
+    if (node.kind === "map") {
+      node = node.value_schema || null;
+      continue;
+    }
+    return null;
+  }
+  return node;
+}
+
+function configPathAttr(path) {
+  return escapeHtml(JSON.stringify(path || []));
+}
+
+function configDomId(scope, section, path) {
+  const token = [scope, section, ...(path || [])]
+    .map((part) => String(part))
+    .join("-")
+    .replaceAll(/[^a-zA-Z0-9_-]+/g, "_");
+  return `config-${token}`;
+}
+
+function castInputValue(rawValue, schema) {
+  if (!schema || typeof schema !== "object") {
+    return rawValue;
+  }
+  if (schema.kind === "bool") {
+    return String(rawValue) === "true";
+  }
+  if (schema.kind === "int") {
+    const parsed = Number.parseInt(String(rawValue || "").trim(), 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (schema.kind === "float") {
+    const parsed = Number.parseFloat(String(rawValue || "").trim());
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return String(rawValue ?? "");
 }
 
 function setNotice(message, type = "info") {
@@ -145,6 +343,7 @@ async function loadBootstrap() {
       messages: Array.isArray(payload.messages) ? payload.messages : [],
       audit: Array.isArray(payload.audit) ? payload.audit : [],
     };
+    syncConfigDrafts(state.data.config || {});
     state.lastLoadedAt = new Date().toISOString();
     if (!state.selectedNodeId && state.data.nodes[0]?.node_id) {
       state.selectedNodeId = String(state.data.nodes[0].node_id);
@@ -590,7 +789,7 @@ function renderChannels() {
       <div class="section-head">
         <div>
           <h3>Channel Summary</h3>
-          <p>Export URLs and edit individual channel protobuf records as JSON.</p>
+          <p>Export URLs and edit channel settings with typed controls instead of raw protobuf JSON.</p>
         </div>
       </div>
       <div class="meta-list">
@@ -606,18 +805,47 @@ function renderChannels() {
         channels.length
           ? channels
               .map(
-                (channel) => `
+                (channel) => {
+                  const section = String(channel.index);
+                  const schema = getConfigSchema("channel", section);
+                  const draft = getConfigDraft("channel", section, channel.raw || {});
+                  const dirty = Boolean(state.configDirty[configDraftKey("channel", section)]);
+                  return `
                   <article class="channel-card">
-                    <div class="section-head">
-                      <div>
-                        <h3>${escapeHtml(channel.name || `Channel ${channel.index}`)}</h3>
-                        <p>${escapeHtml(channel.role || "UNKNOWN")} · index ${escapeHtml(channel.index)}</p>
+                    <form data-action="save-config-section" data-scope="channel" data-section="${escapeHtml(section)}" class="config-section-form">
+                      <div class="section-head">
+                        <div>
+                          <h3>${escapeHtml(channel.name || `Channel ${channel.index}`)}</h3>
+                          <p>${escapeHtml(channel.role || "UNKNOWN")} · index ${escapeHtml(channel.index)}</p>
+                        </div>
+                        <div class="chip-row">
+                          <span class="chip ${dirty ? "chip-warn" : ""}">${escapeHtml(dirty ? "Unsaved changes" : "Saved")}</span>
+                        </div>
                       </div>
-                    </div>
-                    <form data-action="save-channel-json" data-index="${escapeHtml(channel.index)}" class="field">
-                      <label for="channel-json-${escapeHtml(channel.index)}">Channel JSON</label>
-                      <textarea id="channel-json-${escapeHtml(channel.index)}" name="channel_json">${escapeHtml(prettyJson(channel.raw || {}))}</textarea>
+                      ${
+                        schema?.kind === "message"
+                          ? renderConfigMessageFields("channel", section, schema, [], draft)
+                          : `
+                              <div class="field">
+                                <label for="channel-json-${escapeHtml(channel.index)}">Channel JSON</label>
+                                <textarea id="channel-json-${escapeHtml(channel.index)}" name="config_json">${escapeHtml(prettyJson(draft || {}))}</textarea>
+                              </div>
+                            `
+                      }
+                      <details class="config-advanced">
+                        <summary>Advanced JSON preview</summary>
+                        <div class="code-block">${escapeHtml(prettyJson(draft || {}))}</div>
+                      </details>
                       <div class="action-row">
+                        <button
+                          class="inline-btn secondary-btn"
+                          type="button"
+                          data-action-click="reset-config-section"
+                          data-scope="channel"
+                          data-section="${escapeHtml(section)}"
+                        >
+                          Reset Changes
+                        </button>
                         <button class="action-btn" type="submit">Save Channel</button>
                         ${
                           Number(channel.index) > 0
@@ -627,12 +855,335 @@ function renderChannels() {
                       </div>
                     </form>
                   </article>
-                `
+                `;
+                }
               )
               .join("")
           : `<div class="muted">No channel details are available yet.</div>`
       }
     </section>
+  `;
+}
+
+function renderConfigInputControl(scope, section, schema, path, value, label, compact = false) {
+  const id = configDomId(scope, section, path);
+  const kind = String(schema?.kind || "string");
+  const currentValue = value ?? defaultValueForSchema(schema);
+  const helperBits = [];
+  if (kind === "enum" && Array.isArray(schema?.options) && schema.options.length) {
+    helperBits.push(`${schema.options.length} available options`);
+  } else if (kind === "bool") {
+    helperBits.push("Select true or false");
+  } else if (kind === "int") {
+    helperBits.push("Whole number");
+  } else if (kind === "float") {
+    helperBits.push("Decimal number");
+  }
+  const helper = helperBits.length ? `<div class="helper">${escapeHtml(helperBits.join(" · "))}</div>` : "";
+  const fieldClass = compact ? "field config-field compact" : "field config-field";
+
+  if (kind === "bool") {
+    return `
+      <div class="${fieldClass}">
+        <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
+        <select
+          id="${escapeHtml(id)}"
+          data-config-input="true"
+          data-scope="${escapeHtml(scope)}"
+          data-section="${escapeHtml(section)}"
+          data-config-path="${configPathAttr(path)}"
+        >
+          <option value="true" ${currentValue === true ? "selected" : ""}>True</option>
+          <option value="false" ${currentValue === false ? "selected" : ""}>False</option>
+        </select>
+        ${helper}
+      </div>
+    `;
+  }
+
+  if (kind === "enum") {
+    return `
+      <div class="${fieldClass}">
+        <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
+        <select
+          id="${escapeHtml(id)}"
+          data-config-input="true"
+          data-scope="${escapeHtml(scope)}"
+          data-section="${escapeHtml(section)}"
+          data-config-path="${configPathAttr(path)}"
+        >
+          ${(schema.options || [])
+            .map(
+              (option) =>
+                `<option value="${escapeHtml(option.value)}" ${String(currentValue || "") === String(option.value) ? "selected" : ""}>${escapeHtml(option.label || option.value)}</option>`
+            )
+            .join("")}
+        </select>
+        ${helper}
+      </div>
+    `;
+  }
+
+  const inputType = kind === "int" || kind === "float" ? "number" : "text";
+  const step = kind === "float" ? "any" : "1";
+  return `
+    <div class="${fieldClass}">
+      <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
+      <input
+        id="${escapeHtml(id)}"
+        type="${escapeHtml(inputType)}"
+        step="${escapeHtml(step)}"
+        value="${escapeHtml(currentValue ?? "")}"
+        data-config-input="true"
+        data-scope="${escapeHtml(scope)}"
+        data-section="${escapeHtml(section)}"
+        data-config-path="${configPathAttr(path)}"
+      />
+      ${helper}
+    </div>
+  `;
+}
+
+function renderConfigArrayField(scope, section, fieldSchema, path, value) {
+  const items = Array.isArray(value) ? value : [];
+  const itemSchema = fieldSchema.item_schema || { kind: "string" };
+  return `
+    <section class="config-group">
+      <div class="config-group-head">
+        <div>
+          <h4>${escapeHtml(fieldSchema.label || labelizeName(fieldSchema.name))}</h4>
+          <p>${escapeHtml(items.length ? `${items.length} item${items.length === 1 ? "" : "s"}` : "No entries yet.")}</p>
+        </div>
+        <button
+          class="inline-btn secondary-btn"
+          type="button"
+          data-action-click="config-array-add"
+          data-scope="${escapeHtml(scope)}"
+          data-section="${escapeHtml(section)}"
+          data-field-path="${configPathAttr(path)}"
+        >
+          Add Item
+        </button>
+      </div>
+      <div class="config-array-list">
+        ${
+          items.length
+            ? items
+                .map((item, index) => {
+                  const itemPath = [...path, index];
+                  const body =
+                    itemSchema.kind === "message"
+                      ? renderConfigMessageFields(scope, section, itemSchema, itemPath, item || {})
+                      : renderConfigInputControl(
+                          scope,
+                          section,
+                          itemSchema,
+                          itemPath,
+                          item,
+                          `${fieldSchema.label || labelizeName(fieldSchema.name)} ${index + 1}`,
+                          true
+                        );
+                  return `
+                    <article class="config-array-item">
+                      <div class="config-array-item-head">
+                        <div class="helper">Item ${escapeHtml(index + 1)}</div>
+                        <button
+                          class="inline-btn secondary-btn"
+                          type="button"
+                          data-action-click="config-array-remove"
+                          data-scope="${escapeHtml(scope)}"
+                          data-section="${escapeHtml(section)}"
+                          data-field-path="${configPathAttr(path)}"
+                          data-index="${escapeHtml(index)}"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                      ${body}
+                    </article>
+                  `;
+                })
+                .join("")
+            : `<div class="muted">No entries yet.</div>`
+        }
+      </div>
+    </section>
+  `;
+}
+
+function renderConfigMapField(scope, section, fieldSchema, path, value) {
+  const entries = Object.entries(value || {});
+  const valueSchema = fieldSchema.value_schema || { kind: "string" };
+  return `
+    <section class="config-group">
+      <div class="config-group-head">
+        <div>
+          <h4>${escapeHtml(fieldSchema.label || labelizeName(fieldSchema.name))}</h4>
+          <p>${escapeHtml(entries.length ? `${entries.length} key/value entries` : "No entries yet.")}</p>
+        </div>
+        <button
+          class="inline-btn secondary-btn"
+          type="button"
+          data-action-click="config-map-add"
+          data-scope="${escapeHtml(scope)}"
+          data-section="${escapeHtml(section)}"
+          data-field-path="${configPathAttr(path)}"
+        >
+          Add Entry
+        </button>
+      </div>
+      <div class="config-map-list">
+        ${
+          entries.length
+            ? entries
+                .map(([key, entryValue]) => {
+                  const entryPath = [...path, key];
+                  const valueMarkup =
+                    valueSchema.kind === "message"
+                      ? renderConfigMessageFields(scope, section, valueSchema, entryPath, entryValue || {})
+                      : renderConfigInputControl(scope, section, valueSchema, entryPath, entryValue, "Value", true);
+                  return `
+                    <article class="config-map-item">
+                      <div class="config-map-row">
+                        <div class="field config-field compact">
+                          <label>Key</label>
+                          <input
+                            value="${escapeHtml(key)}"
+                            data-config-map-key="true"
+                            data-scope="${escapeHtml(scope)}"
+                            data-section="${escapeHtml(section)}"
+                            data-field-path="${configPathAttr(path)}"
+                            data-map-key="${escapeHtml(key)}"
+                          />
+                        </div>
+                        <button
+                          class="inline-btn secondary-btn"
+                          type="button"
+                          data-action-click="config-map-remove"
+                          data-scope="${escapeHtml(scope)}"
+                          data-section="${escapeHtml(section)}"
+                          data-field-path="${configPathAttr(path)}"
+                          data-map-key="${escapeHtml(key)}"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                      ${valueMarkup}
+                    </article>
+                  `;
+                })
+                .join("")
+            : `<div class="muted">No entries yet.</div>`
+        }
+      </div>
+    </section>
+  `;
+}
+
+function renderConfigField(scope, section, fieldSchema, path, value) {
+  if (fieldSchema.kind === "message") {
+    return `
+      <section class="config-group">
+        <div class="config-group-head">
+          <div>
+            <h4>${escapeHtml(fieldSchema.label || labelizeName(fieldSchema.name))}</h4>
+            <p>${escapeHtml((fieldSchema.fields || []).length)} fields</p>
+          </div>
+        </div>
+        ${renderConfigMessageFields(scope, section, fieldSchema, path, value || {})}
+      </section>
+    `;
+  }
+
+  if (fieldSchema.kind === "array") {
+    return renderConfigArrayField(scope, section, fieldSchema, path, value);
+  }
+
+  if (fieldSchema.kind === "map") {
+    return renderConfigMapField(scope, section, fieldSchema, path, value);
+  }
+
+  return renderConfigInputControl(scope, section, fieldSchema, path, value, fieldSchema.label || labelizeName(fieldSchema.name));
+}
+
+function renderConfigMessageFields(scope, section, schema, path, values) {
+  return `
+    <div class="config-fields-grid">
+      ${(schema.fields || [])
+        .map((field) => renderConfigField(scope, section, field, [...path, field.name], getValueAtPath(values || {}, [field.name], defaultValueForSchema(field))))
+        .join("")}
+    </div>
+  `;
+}
+
+function renderConfigSection(scope, section, value, schema) {
+  const draft = getConfigDraft(scope, section, value || {});
+  const dirty = Boolean(state.configDirty[configDraftKey(scope, section)]);
+  const label = schema?.label || labelizeName(section);
+  const summary = schema?.fields?.length ? `${schema.fields.length} available fields` : "Manual JSON fallback";
+
+  return `
+    <article class="config-card">
+      <form data-action="save-config-section" data-scope="${escapeHtml(scope)}" data-section="${escapeHtml(section)}" class="config-section-form">
+        <div class="section-head">
+          <div>
+            <h3>${escapeHtml(label)}</h3>
+            <p>${escapeHtml(summary)}</p>
+          </div>
+          <div class="chip-row">
+            <span class="chip ${dirty ? "chip-warn" : ""}">${escapeHtml(dirty ? "Unsaved changes" : "Saved")}</span>
+          </div>
+        </div>
+        ${
+          schema?.kind === "message"
+            ? renderConfigMessageFields(scope, section, schema, [], draft)
+            : `
+                <div class="field">
+                  <label for="config-fallback-${escapeHtml(scope)}-${escapeHtml(section)}">${escapeHtml(label)}</label>
+                  <textarea id="config-fallback-${escapeHtml(scope)}-${escapeHtml(section)}" name="config_json">${escapeHtml(prettyJson(draft || {}))}</textarea>
+                </div>
+              `
+        }
+        <details class="config-advanced">
+          <summary>Advanced JSON preview</summary>
+          <div class="code-block">${escapeHtml(prettyJson(draft || {}))}</div>
+        </details>
+        <div class="action-row">
+          <button
+            class="inline-btn secondary-btn"
+            type="button"
+            data-action-click="reset-config-section"
+            data-scope="${escapeHtml(scope)}"
+            data-section="${escapeHtml(section)}"
+          >
+            Reset Changes
+          </button>
+          <button class="action-btn" type="submit">Save ${escapeHtml(label)}</button>
+        </div>
+      </form>
+    </article>
+  `;
+}
+
+function renderConfigScope(title, description, scope, sections) {
+  return `
+    <article class="panel">
+      <div class="section-head">
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+          <p>${escapeHtml(description)}</p>
+        </div>
+      </div>
+      <div class="config-stack">
+        ${
+          sections.length
+            ? sections
+                .map(([section, value]) => renderConfigSection(scope, section, value, getConfigSchema(scope, section)))
+                .join("")
+            : `<div class="muted">No ${escapeHtml(scope)} config snapshot is available yet.</div>`
+        }
+      </div>
+    </article>
   `;
 }
 
@@ -642,53 +1193,18 @@ function renderConfigs() {
   const moduleSections = Object.entries(config.module || {});
   return `
     <section class="config-grid">
-      <article class="config-card">
-        <div class="section-head">
-          <div>
-            <h3>Local Config Sections</h3>
-            <p>Save only after reviewing the full JSON for the section you are editing.</p>
-          </div>
-        </div>
-        ${
-          localSections.length
-            ? localSections
-                .map(
-                  ([section, value]) => `
-                    <form data-action="save-config-section" data-scope="local" data-section="${escapeHtml(section)}" class="field">
-                      <label for="config-local-${escapeHtml(section)}">${escapeHtml(section)}</label>
-                      <textarea id="config-local-${escapeHtml(section)}" name="config_json">${escapeHtml(prettyJson(value))}</textarea>
-                      <button class="action-btn" type="submit">Save ${escapeHtml(section)}</button>
-                    </form>
-                  `
-                )
-                .join("")
-            : `<div class="muted">No local config snapshot is available yet.</div>`
-        }
-      </article>
-
-      <article class="config-card">
-        <div class="section-head">
-          <div>
-            <h3>Module Config Sections</h3>
-            <p>These mirror module-level settings like telemetry, MQTT, audio, and related features.</p>
-          </div>
-        </div>
-        ${
-          moduleSections.length
-            ? moduleSections
-                .map(
-                  ([section, value]) => `
-                    <form data-action="save-config-section" data-scope="module" data-section="${escapeHtml(section)}" class="field">
-                      <label for="config-module-${escapeHtml(section)}">${escapeHtml(section)}</label>
-                      <textarea id="config-module-${escapeHtml(section)}" name="config_json">${escapeHtml(prettyJson(value))}</textarea>
-                      <button class="action-btn" type="submit">Save ${escapeHtml(section)}</button>
-                    </form>
-                  `
-                )
-                .join("")
-            : `<div class="muted">No module config snapshot is available yet.</div>`
-        }
-      </article>
+      ${renderConfigScope(
+        "Local Config Sections",
+        "Typed controls pulled from the radio config schema. Select from valid enum values instead of editing raw JSON.",
+        "local",
+        localSections
+      )}
+      ${renderConfigScope(
+        "Module Config Sections",
+        "Module-level settings like telemetry, MQTT, serial, audio, and related features.",
+        "module",
+        moduleSections
+      )}
     </section>
   `;
 }
@@ -925,13 +1441,26 @@ async function handleFormSubmit(form) {
     if (action === "save-config-section") {
       const scope = String(form.dataset.scope || "").trim();
       const section = String(form.dataset.section || "").trim();
-      const values = JSON.parse(form.config_json.value);
-      await apiFetch(`/config/${encodeURIComponent(scope)}/${encodeURIComponent(section)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ values }),
-      });
-      setNotice(`${scope}.${section} saved.`);
+      const key = configDraftKey(scope, section);
+      const values =
+        form.config_json && !getConfigSchema(scope, section)
+          ? JSON.parse(form.config_json.value)
+          : deepClone(getConfigDraft(scope, section, getConfigSourceValue(scope, section)), {});
+      if (scope === "channel") {
+        await apiFetch(`/channels/${encodeURIComponent(section)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ channel: values }),
+        });
+      } else {
+        await apiFetch(`/config/${encodeURIComponent(scope)}/${encodeURIComponent(section)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values }),
+        });
+      }
+      state.configDirty[key] = false;
+      setNotice(scope === "channel" ? `Channel ${section} saved.` : `${scope}.${section} saved.`);
       await loadBootstrap();
       return;
     }
@@ -956,6 +1485,84 @@ async function handleActionClick(button) {
     return;
   }
   try {
+    if (action === "reset-config-section") {
+      const scope = String(button.dataset.scope || "").trim();
+      const section = String(button.dataset.section || "").trim();
+      const key = configDraftKey(scope, section);
+      state.configDrafts[key] = deepClone(getConfigSourceValue(scope, section), {});
+      state.configDirty[key] = false;
+      render();
+      setNotice(`${scope}.${section} reset to the latest bridge snapshot.`);
+      return;
+    }
+
+    if (action === "config-array-add") {
+      const scope = String(button.dataset.scope || "").trim();
+      const section = String(button.dataset.section || "").trim();
+      const fieldPath = JSON.parse(String(button.dataset.fieldPath || "[]"));
+      const draft = getConfigDraft(scope, section, getConfigSourceValue(scope, section));
+      const sectionSchema = getConfigSchema(scope, section);
+      const fieldSchema = resolveSchemaNode(sectionSchema, fieldPath);
+      const arrayValue = getValueAtPath(draft, fieldPath, []);
+      const nextValue = defaultValueForSchema(fieldSchema?.item_schema || { kind: "string" });
+      if (!Array.isArray(arrayValue)) {
+        setValueAtPath(draft, fieldPath, [nextValue]);
+      } else {
+        arrayValue.push(nextValue);
+      }
+      state.configDirty[configDraftKey(scope, section)] = true;
+      render();
+      return;
+    }
+
+    if (action === "config-array-remove") {
+      const scope = String(button.dataset.scope || "").trim();
+      const section = String(button.dataset.section || "").trim();
+      const fieldPath = JSON.parse(String(button.dataset.fieldPath || "[]"));
+      const index = Number.parseInt(String(button.dataset.index || "0"), 10) || 0;
+      const draft = getConfigDraft(scope, section, getConfigSourceValue(scope, section));
+      removeArrayItem(draft, fieldPath, index);
+      state.configDirty[configDraftKey(scope, section)] = true;
+      render();
+      return;
+    }
+
+    if (action === "config-map-add") {
+      const scope = String(button.dataset.scope || "").trim();
+      const section = String(button.dataset.section || "").trim();
+      const fieldPath = JSON.parse(String(button.dataset.fieldPath || "[]"));
+      const draft = getConfigDraft(scope, section, getConfigSourceValue(scope, section));
+      const sectionSchema = getConfigSchema(scope, section);
+      const fieldSchema = resolveSchemaNode(sectionSchema, fieldPath);
+      const rawMapValue = getValueAtPath(draft, fieldPath, {});
+      const mapValue = rawMapValue && typeof rawMapValue === "object" && !Array.isArray(rawMapValue) ? rawMapValue : {};
+      let nextKey = `entry_${Object.keys(mapValue || {}).length + 1}`;
+      while (mapValue && Object.prototype.hasOwnProperty.call(mapValue, nextKey)) {
+        nextKey = `${nextKey}_1`;
+      }
+      mapValue[nextKey] = defaultValueForSchema(fieldSchema?.value_schema || { kind: "string" });
+      setValueAtPath(draft, fieldPath, mapValue);
+      state.configDirty[configDraftKey(scope, section)] = true;
+      render();
+      return;
+    }
+
+    if (action === "config-map-remove") {
+      const scope = String(button.dataset.scope || "").trim();
+      const section = String(button.dataset.section || "").trim();
+      const fieldPath = JSON.parse(String(button.dataset.fieldPath || "[]"));
+      const mapKey = String(button.dataset.mapKey || "").trim();
+      const draft = getConfigDraft(scope, section, getConfigSourceValue(scope, section));
+      const rawMapValue = getValueAtPath(draft, fieldPath, {});
+      const mapValue = rawMapValue && typeof rawMapValue === "object" && !Array.isArray(rawMapValue) ? rawMapValue : {};
+      if (mapValue && typeof mapValue === "object") {
+        delete mapValue[mapKey];
+        state.configDirty[configDraftKey(scope, section)] = true;
+        render();
+      }
+      return;
+    }
+
     if (action === "delete-channel") {
       const index = String(button.dataset.index || "").trim();
       const confirmed = window.confirm(`Delete secondary channel ${index}?`);
@@ -994,6 +1601,55 @@ function installEventHandlers() {
 
   const root = document.getElementById("view-root");
   if (root) {
+    const handleConfigDraftInput = (event) => {
+      const element =
+        event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || event.target instanceof HTMLTextAreaElement
+          ? event.target
+          : null;
+      if (!element) {
+        return;
+      }
+
+      if (element.dataset.configMapKey === "true" && event.type === "change") {
+        const scope = String(element.dataset.scope || "").trim();
+        const section = String(element.dataset.section || "").trim();
+        const fieldPath = JSON.parse(String(element.dataset.fieldPath || "[]"));
+        const oldKey = String(element.dataset.mapKey || "").trim();
+        const newKey = String(element.value || "").trim();
+        if (!newKey || newKey === oldKey) {
+          element.value = oldKey;
+          return;
+        }
+        const draft = getConfigDraft(scope, section, getConfigSourceValue(scope, section));
+        const rawMapValue = getValueAtPath(draft, fieldPath, {});
+        const mapValue = rawMapValue && typeof rawMapValue === "object" && !Array.isArray(rawMapValue) ? rawMapValue : {};
+        if (Object.prototype.hasOwnProperty.call(mapValue, newKey)) {
+          setNotice(`Key '${newKey}' already exists in ${scope}.${section}.`, "error");
+          element.value = oldKey;
+          return;
+        }
+        mapValue[newKey] = mapValue[oldKey];
+        delete mapValue[oldKey];
+        element.dataset.mapKey = newKey;
+        state.configDirty[configDraftKey(scope, section)] = true;
+        render();
+        return;
+      }
+
+      if (element.dataset.configInput !== "true") {
+        return;
+      }
+
+      const scope = String(element.dataset.scope || "").trim();
+      const section = String(element.dataset.section || "").trim();
+      const path = JSON.parse(String(element.dataset.configPath || "[]"));
+      const draft = getConfigDraft(scope, section, getConfigSourceValue(scope, section));
+      const sectionSchema = getConfigSchema(scope, section);
+      const schemaNode = resolveSchemaNode(sectionSchema, path);
+      setValueAtPath(draft, path, castInputValue(element.value, schemaNode));
+      state.configDirty[configDraftKey(scope, section)] = true;
+    };
+
     root.addEventListener("submit", async (event) => {
       event.preventDefault();
       const form = event.target instanceof HTMLFormElement ? event.target : null;
@@ -1012,6 +1668,9 @@ function installEventHandlers() {
         await handleActionClick(target);
       }
     });
+
+    root.addEventListener("input", handleConfigDraftInput);
+    root.addEventListener("change", handleConfigDraftInput);
   }
 }
 

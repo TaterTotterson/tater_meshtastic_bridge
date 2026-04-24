@@ -373,6 +373,11 @@ select {
   font-size: 0.88rem;
 }
 
+.chip-warn {
+  border-color: rgba(241, 182, 88, 0.35);
+  color: #ffdca6;
+}
+
 .table-panel {
   overflow: hidden;
 }
@@ -447,6 +452,81 @@ tbody tr:hover {
   gap: 16px;
 }
 
+.config-grid {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+}
+
+.config-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.config-section-form {
+  display: grid;
+  gap: 14px;
+}
+
+.config-fields-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.config-group {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.config-group-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.config-group-head h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.config-group-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.config-array-list,
+.config-map-list {
+  display: grid;
+  gap: 12px;
+}
+
+.config-array-item,
+.config-map-item {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(10, 11, 13, 0.42);
+}
+
+.config-array-item-head,
+.config-map-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.config-map-row .field {
+  flex: 1;
+}
+
 .field-grid {
   display: grid;
   gap: 12px;
@@ -480,6 +560,26 @@ tbody tr:hover {
   font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
   font-size: 0.9rem;
   line-height: 1.45;
+}
+
+.config-field input,
+.config-field select {
+  min-height: 44px;
+}
+
+.config-field.compact label {
+  font-size: 0.84rem;
+}
+
+.config-advanced {
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  padding-top: 12px;
+}
+
+.config-advanced summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .helper {
@@ -518,6 +618,10 @@ tbody tr:hover {
   .split-grid {
     grid-template-columns: 1fr;
   }
+
+  .config-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 900px) {
@@ -539,5 +643,12 @@ tbody tr:hover {
   .topbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .config-group-head,
+  .config-array-item-head,
+  .config-map-row {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

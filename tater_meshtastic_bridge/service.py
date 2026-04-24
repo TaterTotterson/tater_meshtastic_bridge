@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from threading import Event, Lock, RLock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from google.protobuf.json_format import MessageToDict, ParseDict
 
 from .config import Settings
@@ -15,6 +16,8 @@ from .store import EventBuffer
 
 
 logger = logging.getLogger("tater_meshtastic_bridge")
+_STATIC_CONFIG_SCHEMA_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_STATIC_CHANNEL_SCHEMA_CACHE: Optional[Dict[str, Any]] = None
 
 
 def _utc_now_iso() -> str:
@@ -74,6 +77,218 @@ def _proto_to_dict(message: Any) -> Dict[str, Any]:
         )
     except Exception:
         return _plain_data(message, depth=5) if isinstance(message, dict) else {}
+
+
+_PROTO_SCALAR_KINDS = {
+    FieldDescriptor.TYPE_BOOL: "bool",
+    FieldDescriptor.TYPE_BYTES: "bytes",
+    FieldDescriptor.TYPE_DOUBLE: "float",
+    FieldDescriptor.TYPE_FIXED32: "int",
+    FieldDescriptor.TYPE_FIXED64: "int",
+    FieldDescriptor.TYPE_FLOAT: "float",
+    FieldDescriptor.TYPE_INT32: "int",
+    FieldDescriptor.TYPE_INT64: "int",
+    FieldDescriptor.TYPE_SFIXED32: "int",
+    FieldDescriptor.TYPE_SFIXED64: "int",
+    FieldDescriptor.TYPE_SINT32: "int",
+    FieldDescriptor.TYPE_SINT64: "int",
+    FieldDescriptor.TYPE_STRING: "string",
+    FieldDescriptor.TYPE_UINT32: "int",
+    FieldDescriptor.TYPE_UINT64: "int",
+}
+
+
+def _labelize_name(name: str) -> str:
+    token = str(name or "").strip().replace("_", " ")
+    return " ".join(part[:1].upper() + part[1:] for part in token.split())
+
+
+def _enum_default_name(field: FieldDescriptor) -> str:
+    try:
+        default_number = int(field.default_value)
+        for value in field.enum_type.values:
+            if int(value.number) == default_number:
+                return str(value.name)
+    except Exception:
+        pass
+    try:
+        return str(field.enum_type.values[0].name)
+    except Exception:
+        return ""
+
+
+def _proto_default_value(field: FieldDescriptor, *, repeated: Optional[bool] = None) -> Any:
+    is_repeated = field.label == FieldDescriptor.LABEL_REPEATED if repeated is None else bool(repeated)
+    if is_repeated:
+        if field.type == FieldDescriptor.TYPE_MESSAGE and field.message_type and field.message_type.GetOptions().map_entry:
+            return {}
+        return []
+    if field.type == FieldDescriptor.TYPE_MESSAGE:
+        return {}
+    if field.type == FieldDescriptor.TYPE_ENUM:
+        return _enum_default_name(field)
+    if field.type == FieldDescriptor.TYPE_BOOL:
+        return bool(field.default_value)
+    if field.type == FieldDescriptor.TYPE_BYTES:
+        raw = field.default_value or b""
+        return raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    if field.type in _PROTO_SCALAR_KINDS:
+        return field.default_value
+    return None
+
+
+def _enum_options(field: FieldDescriptor) -> List[Dict[str, Any]]:
+    enum_type = getattr(field, "enum_type", None)
+    if enum_type is None:
+        return []
+    return [
+        {
+            "label": str(value.name),
+            "value": str(value.name),
+            "number": int(value.number),
+        }
+        for value in enum_type.values
+    ]
+
+
+def _single_value_field_schema(field: FieldDescriptor) -> Dict[str, Any]:
+    base = {
+        "name": field.name,
+        "label": _labelize_name(field.name),
+        "number": int(field.number),
+        "default": _proto_default_value(field, repeated=False),
+    }
+
+    if field.type == FieldDescriptor.TYPE_MESSAGE and field.message_type and field.message_type.GetOptions().map_entry:
+        key_field = field.message_type.fields_by_name.get("key")
+        value_field = field.message_type.fields_by_name.get("value")
+        return {
+            **base,
+            "kind": "map",
+            "default": {},
+            "key_schema": _field_schema(key_field) if key_field is not None else {"kind": "string", "default": ""},
+            "value_schema": _field_schema(value_field) if value_field is not None else {"kind": "string", "default": ""},
+        }
+
+    if field.type == FieldDescriptor.TYPE_MESSAGE:
+        return {
+            **base,
+            "kind": "message",
+            "fields": _descriptor_schema(field.message_type).get("fields", []),
+            "default": {},
+        }
+
+    if field.type == FieldDescriptor.TYPE_ENUM:
+        return {
+            **base,
+            "kind": "enum",
+            "options": _enum_options(field),
+        }
+
+    return {
+        **base,
+        "kind": _PROTO_SCALAR_KINDS.get(field.type, "string"),
+    }
+
+
+def _field_schema(field: FieldDescriptor) -> Dict[str, Any]:
+    if field.label == FieldDescriptor.LABEL_REPEATED and not (
+        field.type == FieldDescriptor.TYPE_MESSAGE and field.message_type and field.message_type.GetOptions().map_entry
+    ):
+        base = {
+            "name": field.name,
+            "label": _labelize_name(field.name),
+            "number": int(field.number),
+            "kind": "array",
+            "default": [],
+            "item_schema": _single_value_field_schema(field),
+        }
+        return base
+    return _single_value_field_schema(field)
+
+
+def _descriptor_schema(descriptor: Optional[Descriptor], *, label: str = "") -> Dict[str, Any]:
+    if descriptor is None:
+        return {"kind": "message", "label": label, "fields": []}
+    return {
+        "kind": "message",
+        "label": label or _labelize_name(getattr(descriptor, "name", "")),
+        "fields": [_field_schema(field) for field in getattr(descriptor, "fields", []) or []],
+    }
+
+
+def _static_config_schemas() -> Dict[str, Dict[str, Any]]:
+    global _STATIC_CONFIG_SCHEMA_CACHE
+    if _STATIC_CONFIG_SCHEMA_CACHE is not None:
+        return {
+            "local": dict(_STATIC_CONFIG_SCHEMA_CACHE.get("local") or {}),
+            "module": dict(_STATIC_CONFIG_SCHEMA_CACHE.get("module") or {}),
+        }
+
+    local_schemas: Dict[str, Any] = {}
+    module_schemas: Dict[str, Any] = {}
+    try:
+        from meshtastic.protobuf import config_pb2, module_config_pb2
+
+        for field in getattr(config_pb2.Config.DESCRIPTOR, "fields", []) or []:
+            local_schemas[field.name] = _descriptor_schema(field.message_type, label=_labelize_name(field.name))
+        for field in getattr(module_config_pb2.ModuleConfig.DESCRIPTOR, "fields", []) or []:
+            module_schemas[field.name] = _descriptor_schema(field.message_type, label=_labelize_name(field.name))
+    except Exception:
+        logger.debug("Unable to build static Meshtastic config schemas", exc_info=True)
+
+    _STATIC_CONFIG_SCHEMA_CACHE = {
+        "local": local_schemas,
+        "module": module_schemas,
+    }
+    return {
+        "local": dict(local_schemas),
+        "module": dict(module_schemas),
+    }
+
+
+def _static_channel_schema() -> Dict[str, Any]:
+    global _STATIC_CHANNEL_SCHEMA_CACHE
+    if _STATIC_CHANNEL_SCHEMA_CACHE is not None:
+        return dict(_STATIC_CHANNEL_SCHEMA_CACHE)
+
+    schema: Dict[str, Any] = {"kind": "message", "label": "Channel", "fields": []}
+    try:
+        from meshtastic.protobuf import channel_pb2
+
+        schema = _descriptor_schema(channel_pb2.Channel.DESCRIPTOR, label="Channel")
+    except Exception:
+        logger.debug("Unable to build static Meshtastic channel schema", exc_info=True)
+
+    _STATIC_CHANNEL_SCHEMA_CACHE = dict(schema)
+    return dict(schema)
+
+
+def _normalize_channel_record(record: Any) -> Dict[str, Any]:
+    plain = dict(record or {}) if isinstance(record, dict) else {}
+    return {
+        **plain,
+        "schema": dict(plain.get("schema") or _static_channel_schema()),
+    }
+
+
+def _normalize_config_snapshot(payload: Any) -> Dict[str, Any]:
+    plain = dict(payload or {}) if isinstance(payload, dict) else {}
+    static_schemas = _static_config_schemas()
+    payload_schemas = plain.get("schemas") or {}
+    local_schemas = dict(static_schemas.get("local") or {})
+    local_schemas.update(dict((payload_schemas.get("local") or {})))
+    module_schemas = dict(static_schemas.get("module") or {})
+    module_schemas.update(dict((payload_schemas.get("module") or {})))
+    return {
+        "timestamp": plain.get("timestamp") or _utc_now_iso(),
+        "local": dict(plain.get("local") or {}),
+        "module": dict(plain.get("module") or {}),
+        "schemas": {
+            "local": local_schemas,
+            "module": module_schemas,
+        },
+    }
 
 
 class MeshtasticBridgeService:
@@ -236,12 +451,12 @@ class MeshtasticBridgeService:
         interface = self._interface
         if interface is None:
             cached = self.database.get_snapshot("channels")
-            return list((cached.get("payload") or {}).get("channels") or [])
+            return [_normalize_channel_record(item) for item in list((cached.get("payload") or {}).get("channels") or [])]
         local_node = getattr(interface, "localNode", None)
         raw_channels = getattr(local_node, "channels", None)
         if raw_channels is None:
             cached = self.database.get_snapshot("channels")
-            return list((cached.get("payload") or {}).get("channels") or [])
+            return [_normalize_channel_record(item) for item in list((cached.get("payload") or {}).get("channels") or [])]
 
         if isinstance(raw_channels, dict):
             iterable = raw_channels.items()
@@ -256,13 +471,15 @@ class MeshtasticBridgeService:
             role = str(plain.get("role") or settings.get("role") or "").strip() if isinstance(plain, dict) else ""
             name = str(settings.get("name") or plain.get("name") or f"Channel {index}").strip() if isinstance(plain, dict) else f"Channel {index}"
             channels.append(
-                {
+                _normalize_channel_record(
+                    {
                     "index": int(index),
                     "name": name,
                     "role": role,
                     "settings": settings,
                     "raw": plain,
-                }
+                    }
+                )
             )
         return channels
 
@@ -291,8 +508,8 @@ class MeshtasticBridgeService:
         cached = self.database.get_snapshot("configs")
         payload = cached.get("payload") or {}
         if payload:
-            return payload
-        return self._live_config_sections()
+            return _normalize_config_snapshot(payload)
+        return _normalize_config_snapshot(self._live_config_sections())
 
     def device_snapshot(self, *, refresh: bool = False) -> Dict[str, Any]:
         if refresh:
@@ -313,7 +530,7 @@ class MeshtasticBridgeService:
             snapshots = {
                 "device": {**status},
                 "channels": {"channels": self.database.get_snapshot("channels").get("payload", {}).get("channels", [])},
-                "configs": self.database.get_snapshot("configs").get("payload", {}),
+                "configs": _normalize_config_snapshot(self.database.get_snapshot("configs").get("payload", {})),
             }
             self._snapshot_cache = snapshots
             return snapshots
@@ -637,31 +854,44 @@ class MeshtasticBridgeService:
         interface = self._interface
         if interface is None:
             cached = self.database.get_snapshot("configs")
-            return cached.get("payload") or {"local": {}, "module": {}, "timestamp": _utc_now_iso()}
+            payload = cached.get("payload") or {}
+            if payload:
+                return _normalize_config_snapshot(payload)
+            return _normalize_config_snapshot({})
 
         local_node = getattr(interface, "localNode", None)
         if local_node is None:
-            return {"local": {}, "module": {}, "timestamp": _utc_now_iso()}
+            return _normalize_config_snapshot({})
 
         local_sections: Dict[str, Any] = {}
+        local_schemas: Dict[str, Any] = {}
         for field in getattr(local_node.localConfig.DESCRIPTOR, "fields", []) or []:
             try:
                 local_sections[field.name] = _proto_to_dict(getattr(local_node.localConfig, field.name))
             except Exception:
                 local_sections[field.name] = {}
+            local_schemas[field.name] = _descriptor_schema(getattr(getattr(local_node.localConfig, field.name), "DESCRIPTOR", None), label=_labelize_name(field.name))
 
         module_sections: Dict[str, Any] = {}
+        module_schemas: Dict[str, Any] = {}
         for field in getattr(local_node.moduleConfig.DESCRIPTOR, "fields", []) or []:
             try:
                 module_sections[field.name] = _proto_to_dict(getattr(local_node.moduleConfig, field.name))
             except Exception:
                 module_sections[field.name] = {}
+            module_schemas[field.name] = _descriptor_schema(getattr(getattr(local_node.moduleConfig, field.name), "DESCRIPTOR", None), label=_labelize_name(field.name))
 
-        return {
-            "timestamp": _utc_now_iso(),
-            "local": local_sections,
-            "module": module_sections,
-        }
+        return _normalize_config_snapshot(
+            {
+                "timestamp": _utc_now_iso(),
+                "local": local_sections,
+                "module": module_sections,
+                "schemas": {
+                    "local": local_schemas,
+                    "module": module_schemas,
+                },
+            }
+        )
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

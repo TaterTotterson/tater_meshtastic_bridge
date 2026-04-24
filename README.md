@@ -6,9 +6,11 @@
 
 - Connects to one Meshtastic node over Bluetooth LE
 - Reconnects automatically after disconnects
-- Normalizes incoming text packets into simple JSON events
+- Normalizes incoming mesh packets into simple JSON events
 - Accepts outbound messages from Tater over HTTP
-- Exposes health, status, node, channel, and device endpoints
+- Keeps durable history in SQLite for messages, nodes, sightings, snapshots, and audit logs
+- Exposes a Tater-style admin Web UI at `GET /ui`
+- Surfaces node, channel, config, device, stats, and audit endpoints for the bridge UI
 
 ## Why run it separately
 
@@ -27,8 +29,41 @@
 - `GET /nodes`
 - `GET /channels`
 - `GET /device`
+- `GET /stats`
+- `GET /audit`
+- `GET /config`
+- `GET /ui`
+- `GET /ui/api/bootstrap`
+- `POST /device/owner`
+- `POST /device/fixed-position`
+- `POST /device/channel-url`
+- `POST /device/canned-message`
+- `POST /device/ringtone`
+- `POST /device/action/{action}`
+- `POST /config/{scope}/{section}`
+- `POST /channels/{index}`
+- `DELETE /channels/{index}`
 
 `/messages` and `/events` support `since_id`, `since`, and `limit` query params.
+
+## Web UI
+
+Open the bridge console at:
+
+```text
+http://127.0.0.1:8433/ui
+```
+
+The Web UI is meant for bridge administration and radio inspection. It currently includes:
+
+- Dashboard with live connection state, stats, URLs, and recent chat
+- Read-only chat log for inbound and outbound mesh messages seen by the bridge
+- Node browser with current nodes, past nodes, and per-node sighting history
+- Channel browser with URL export plus per-channel JSON editing
+- Device + config pages for local config sections, module config sections, owner names, canned messages, ringtone, and fixed position
+- Audit log of bridge-side write actions
+
+The UI does not provide a send-message box. Outbound sends are still intended to come from Tater or the HTTP API.
 
 ## Quick start
 
@@ -45,6 +80,12 @@ source .venv/bin/activate
 pip install -e .
 cp .env.example .env
 tater-meshtastic-bridge
+```
+
+If you change `pyproject.toml` or add package assets later, refresh the editable install:
+
+```bash
+pip install -e .
 ```
 
 ## Finding the BLE device
@@ -84,5 +125,7 @@ If the scan finds nothing:
 - The service uses the official Meshtastic Python package and its pubsub event model.
 - BLE discovery is matched by Meshtastic device name or device address.
 - Auth is optional. If `MESHTASTIC_API_TOKEN` is set, send `Authorization: Bearer <token>` or `X-Tater-Token: <token>`.
-- v1 focuses on text messages and connection state. Telemetry and richer packet types can be layered in later.
+- If the bridge has an API token set, the Web UI shell still loads without auth, but the browser needs that token saved in the UI Settings tab before it can call the protected bridge APIs.
+- `MESHTASTIC_DATABASE_PATH` lets you override where the bridge keeps its SQLite history and snapshots. Leaving it blank uses a platform-appropriate app-data path.
+- The bridge now records text, node updates, radio log lines, and common packet types like `position`, `user`, and `data` when the Meshtastic client publishes them.
 - `MESHTASTIC_SHUTDOWN_TIMEOUT_SECONDS` controls how long the bridge waits for BLE cleanup before continuing shutdown if the Bluetooth stack is hung.

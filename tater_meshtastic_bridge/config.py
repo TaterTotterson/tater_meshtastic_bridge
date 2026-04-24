@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import platform
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -54,6 +56,7 @@ def _optional_int_env(name: str) -> Optional[int]:
 class Settings:
     host: str
     port: int
+    database_path: str
     device_name: str
     device_address: str
     api_token: str
@@ -76,10 +79,23 @@ class Settings:
         return None
 
 
+def _default_database_path() -> str:
+    home = Path.home()
+    system = platform.system().lower()
+    if system == "darwin":
+        base = home / "Library" / "Application Support" / "Tater Meshtastic Bridge"
+    elif system == "windows":
+        base = Path(os.getenv("APPDATA", home)) / "Tater Meshtastic Bridge"
+    else:
+        base = Path(os.getenv("XDG_DATA_HOME", home / ".local" / "share")) / "tater_meshtastic_bridge"
+    return str((base / "bridge.sqlite3").expanduser())
+
+
 def load_settings() -> Settings:
     return Settings(
         host=os.getenv("MESHTASTIC_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1",
         port=_int_env("MESHTASTIC_BRIDGE_PORT", 8433, minimum=1),
+        database_path=os.getenv("MESHTASTIC_DATABASE_PATH", _default_database_path()).strip() or _default_database_path(),
         device_name=os.getenv("MESHTASTIC_DEVICE_NAME", "").strip(),
         device_address=os.getenv("MESHTASTIC_DEVICE_ADDRESS", "").strip(),
         api_token=os.getenv("MESHTASTIC_API_TOKEN", "").strip(),

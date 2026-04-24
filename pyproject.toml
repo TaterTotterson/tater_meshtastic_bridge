@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tater-meshtastic-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Host-side BLE bridge for Tater and Meshtastic radios."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,3 +22,6 @@ tater-meshtastic-bridge = "tater_meshtastic_bridge.main:main"
 
 [tool.setuptools]
 packages = ["tater_meshtastic_bridge"]
+
+[tool.setuptools.package-data]
+tater_meshtastic_bridge = ["webui/*"]

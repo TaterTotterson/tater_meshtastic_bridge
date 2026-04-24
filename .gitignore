@@ -7,5 +7,6 @@
 # Local bridge files
 /.env
 /.venv/
+/*.egg-info/
 /test/
 /tests/

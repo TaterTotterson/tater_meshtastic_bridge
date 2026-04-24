@@ -6,11 +6,11 @@ from typing import Any, Dict, List, Optional
 
 
 class EventBuffer:
-    def __init__(self, capacity: int = 500) -> None:
+    def __init__(self, capacity: int = 500, *, next_id: int = 1) -> None:
         self.capacity = max(1, int(capacity))
         self._events: deque[Dict[str, Any]] = deque(maxlen=self.capacity)
         self._lock = Lock()
-        self._next_id = 1
+        self._next_id = max(1, int(next_id))
 
     def add(self, event: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(event or {})

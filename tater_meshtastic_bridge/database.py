@@ -252,10 +252,18 @@ class BridgeDatabase:
             clauses.append("event_type = ?")
             params.append(str(event_type))
         params.append(max(1, int(limit)))
-        query = (
-            f"SELECT payload_json FROM events WHERE {' AND '.join(clauses)} "
-            "ORDER BY event_id ASC LIMIT ?"
-        )
+        if since_id > 0 or since_ts:
+            query = (
+                f"SELECT payload_json FROM events WHERE {' AND '.join(clauses)} "
+                "ORDER BY event_id ASC LIMIT ?"
+            )
+        else:
+            query = (
+                "SELECT payload_json FROM ("
+                f"SELECT event_id, payload_json FROM events WHERE {' AND '.join(clauses)} "
+                "ORDER BY event_id DESC LIMIT ?"
+                ") ORDER BY event_id ASC"
+            )
         with self._lock, self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [_json_load(row["payload_json"], {}) for row in rows]

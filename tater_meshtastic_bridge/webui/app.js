@@ -13,6 +13,13 @@ const state = {
   view: "dashboard",
   token: safeStorageGet("tater_meshtastic_bridge_token", ""),
   windowHours: Number.parseInt(safeStorageGet("tater_meshtastic_bridge_window_hours", "24"), 10) || 24,
+  chatChannel: safeStorageGet("tater_meshtastic_bridge_chat_channel", ""),
+  selectedChannelIndex: safeStorageGet("tater_meshtastic_bridge_selected_channel", ""),
+  configScope: safeStorageGet("tater_meshtastic_bridge_config_scope", "local"),
+  configSections: {
+    local: safeStorageGet("tater_meshtastic_bridge_config_section_local", ""),
+    module: safeStorageGet("tater_meshtastic_bridge_config_section_module", ""),
+  },
   data: {
     status: {},
     stats: {},
@@ -25,10 +32,22 @@ const state = {
   },
   selectedNodeId: "",
   nodeHistory: [],
+  nodeModal: {
+    open: false,
+    nodeId: "",
+    nodeNum: 0,
+    entity: {},
+    history: [],
+    loading: false,
+    error: "",
+  },
   notice: null,
   pollTimer: 0,
   loading: false,
   lastLoadedAt: "",
+  lastBootstrapPollAt: 0,
+  latestMessageEventId: 0,
+  formDirty: false,
   configDrafts: {},
   configDirty: {},
 };
@@ -38,6 +57,12 @@ const ROOT_PATH = (() => {
   return raw || "/ui";
 })();
 const API_BASE = `${ROOT_PATH}/api`;
+const MAX_CHAT_MESSAGES = 500;
+const nodeMapState = {
+  map: null,
+  markers: [],
+  container: null,
+};
 
 function safeStorageGet(key, fallback = "") {
   try {
@@ -329,7 +354,44 @@ async function apiFetch(path, options = {}) {
   return payload || {};
 }
 
-async function loadBootstrap() {
+function hasUnsavedConfigDrafts() {
+  return Object.values(state.configDirty || {}).some(Boolean);
+}
+
+function isEditableElement(element) {
+  return Boolean(
+    element &&
+      (element instanceof HTMLInputElement ||
+        element instanceof HTMLSelectElement ||
+        element instanceof HTMLTextAreaElement ||
+        element.isContentEditable)
+  );
+}
+
+function shouldPauseAutoRefresh() {
+  if (state.loading || state.nodeModal.open || state.formDirty || hasUnsavedConfigDrafts()) {
+    return true;
+  }
+  return isEditableElement(document.activeElement);
+}
+
+function markGenericFormDirty(element) {
+  if (!isEditableElement(element) || element.dataset.configInput === "true" || element.dataset.configMapKey === "true") {
+    return;
+  }
+  const form = element.closest("form");
+  if (form?.dataset?.action) {
+    state.formDirty = true;
+  }
+}
+
+async function loadBootstrap({ force = true } = {}) {
+  if (!force && shouldPauseAutoRefresh()) {
+    return;
+  }
+  if (force) {
+    state.formDirty = false;
+  }
   state.loading = true;
   try {
     const payload = await apiFetch(`/bootstrap?window_hours=${encodeURIComponent(state.windowHours)}`);
@@ -345,6 +407,8 @@ async function loadBootstrap() {
     };
     syncConfigDrafts(state.data.config || {});
     state.lastLoadedAt = new Date().toISOString();
+    state.lastBootstrapPollAt = Date.now();
+    state.latestMessageEventId = latestMessageEventId(state.data.messages);
     if (!state.selectedNodeId && state.data.nodes[0]?.node_id) {
       state.selectedNodeId = String(state.data.nodes[0].node_id);
     }
@@ -357,6 +421,9 @@ async function loadBootstrap() {
   } finally {
     state.loading = false;
     render();
+    if (force && state.view === "chat") {
+      stickCurrentChatToBottom();
+    }
   }
 }
 
@@ -396,9 +463,116 @@ function renderMetaRows(rows) {
     .join("");
 }
 
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function hasObjectKeys(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length);
+}
+
+function nodeIdFromEntity(entity) {
+  return firstNonEmpty(entity?.node_id, entity?.id, entity?.user?.id);
+}
+
+function nodeNumFromEntity(entity) {
+  const raw = firstNonEmpty(entity?.num, entity?.node_num, entity?.nodeNum);
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function normalizedLocalNode() {
+  const local = state.data.device?.local_node || state.data.status?.local_node || {};
+  return {
+    ...local,
+    node_id: firstNonEmpty(local.node_id, "^local"),
+    live: Boolean(state.data.status?.connected),
+    last_seen: state.data.status?.last_seen || local.last_seen || "",
+  };
+}
+
+function nodeMatchesIdentity(node, identity) {
+  if (!node || !identity) {
+    return false;
+  }
+  const nodeId = nodeIdFromEntity(node).toLowerCase();
+  const identityId = nodeIdFromEntity(identity).toLowerCase();
+  if (nodeId && identityId && nodeId === identityId) {
+    return true;
+  }
+  const nodeNum = nodeNumFromEntity(node);
+  const identityNum = nodeNumFromEntity(identity);
+  return Boolean(nodeNum && identityNum && nodeNum === identityNum);
+}
+
+function findKnownNode(identity) {
+  const entity = typeof identity === "string" ? { node_id: identity } : identity || {};
+  const nodes = state.data.nodes || [];
+  const known = nodes.find((node) => nodeMatchesIdentity(node, entity));
+  if (known) {
+    return known;
+  }
+  const local = normalizedLocalNode();
+  return nodeMatchesIdentity(local, entity) || nodeIdFromEntity(entity) === "^local" ? local : null;
+}
+
+function nodeDisplayName(entity, fallback = "Unknown") {
+  const known = findKnownNode(entity) || {};
+  return (
+    firstNonEmpty(
+      known.long_name,
+      known.short_name,
+      entity?.long_name,
+      entity?.longName,
+      entity?.short_name,
+      entity?.shortName,
+      nodeIdFromEntity(entity),
+      fallback
+    ) || "Unknown"
+  );
+}
+
+function nodeSubtitle(entity) {
+  const known = findKnownNode(entity) || {};
+  const nodeId = firstNonEmpty(known.node_id, nodeIdFromEntity(entity));
+  const shortName = firstNonEmpty(known.short_name, entity?.short_name, entity?.shortName);
+  const bits = [shortName, nodeId].filter(Boolean);
+  return bits.length ? bits.join(" · ") : "Node details";
+}
+
+function messageDomKey(message) {
+  return firstNonEmpty(
+    message?.event_id,
+    message?.message_id,
+    `${message?.timestamp || ""}:${message?.direction || ""}:${message?.channel ?? ""}:${String(message?.text || "").slice(0, 40)}`
+  );
+}
+
+function findMessageByDomKey(key) {
+  const token = String(key || "").trim();
+  if (!token) {
+    return null;
+  }
+  return (state.data.messages || []).find((message) => messageDomKey(message) === token) || null;
+}
+
+function nodeEntityForMessage(message, side) {
+  const token = String(side || "from").trim();
+  if (token === "to") {
+    return message?.to || {};
+  }
+  return message?.from || {};
+}
+
 function messageCard(message) {
-  const fromName = message?.from?.long_name || message?.from?.short_name || message?.from?.node_id || "Unknown";
-  const toName = message?.to?.long_name || message?.to?.short_name || message?.to?.node_id || "Unknown";
+  const fromName = nodeDisplayName(message?.from);
+  const toName = nodeDisplayName(message?.to);
   const body = String(message?.text || "").trim();
   const direction = String(message?.direction || "inbound").trim();
   return `
@@ -410,6 +584,219 @@ function messageCard(message) {
         <span>${escapeHtml(formatTs(message?.timestamp))}</span>
       </div>
       <div class="message-body ${body ? "" : "empty"}">${body ? escapeHtml(body) : "No text payload on this packet."}</div>
+    </article>
+  `;
+}
+
+function channelKey(value) {
+  const text = String(value ?? "").trim();
+  return text === "" ? "0" : text;
+}
+
+function messageChannelKey(message) {
+  return channelKey(message?.channel ?? 0);
+}
+
+function channelName(channel) {
+  const index = channelKey(channel?.index ?? 0);
+  return String(channel?.name || channel?.raw?.settings?.name || "").trim() || `Channel ${index}`;
+}
+
+function channelRowsForChat(messages) {
+  const counts = new Map();
+  const channelMap = new Map();
+
+  (state.data.channels || []).forEach((channel) => {
+    const key = channelKey(channel?.index ?? 0);
+    channelMap.set(key, {
+      key,
+      index: Number.parseInt(key, 10),
+      name: channelName(channel),
+      role: String(channel?.role || "").trim(),
+      count: 0,
+    });
+  });
+
+  messages.forEach((message) => {
+    const key = messageChannelKey(message);
+    counts.set(key, (counts.get(key) || 0) + 1);
+    if (!channelMap.has(key)) {
+      channelMap.set(key, {
+        key,
+        index: Number.parseInt(key, 10),
+        name: `Channel ${key}`,
+        role: "",
+        count: 0,
+      });
+    }
+  });
+
+  const rows = Array.from(channelMap.values()).map((row) => ({
+    ...row,
+    count: counts.get(row.key) || 0,
+  }));
+
+  rows.sort((a, b) => {
+    const aNum = Number.isFinite(a.index) ? a.index : 9999;
+    const bNum = Number.isFinite(b.index) ? b.index : 9999;
+    return aNum - bNum || String(a.name).localeCompare(String(b.name));
+  });
+
+  return rows;
+}
+
+function activeChatChannel(rows, messages) {
+  const savedRaw = String(state.chatChannel || "").trim();
+  const saved = savedRaw ? channelKey(savedRaw) : "";
+  if (saved && rows.some((row) => row.key === saved)) {
+    return saved;
+  }
+  const sortedMessages = [...messages].sort(compareMessages);
+  const latestMessage = sortedMessages[sortedMessages.length - 1];
+  const fallback = latestMessage ? messageChannelKey(latestMessage) : rows[0]?.key || "0";
+  state.chatChannel = fallback;
+  safeStorageSet("tater_meshtastic_bridge_chat_channel", fallback);
+  return fallback;
+}
+
+function compareMessages(a, b) {
+  const aId = Number(a?.event_id ?? a?.id ?? 0);
+  const bId = Number(b?.event_id ?? b?.id ?? 0);
+  if (aId || bId) {
+    return aId - bId;
+  }
+  const aTs = Date.parse(String(a?.timestamp || ""));
+  const bTs = Date.parse(String(b?.timestamp || ""));
+  return (Number.isNaN(aTs) ? 0 : aTs) - (Number.isNaN(bTs) ? 0 : bTs);
+}
+
+function messageEventId(message) {
+  const value = Number(message?.event_id ?? message?.id ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function latestMessageEventId(messages) {
+  return (messages || []).reduce((latest, message) => Math.max(latest, messageEventId(message)), 0);
+}
+
+function mergeMessages(messages) {
+  const byKey = new Map();
+  [...(state.data.messages || []), ...(messages || [])].forEach((message) => {
+    const key = messageDomKey(message);
+    if (key) {
+      byKey.set(key, message);
+    }
+  });
+  const merged = Array.from(byKey.values()).sort(compareMessages);
+  state.data.messages = merged.slice(Math.max(0, merged.length - MAX_CHAT_MESSAGES));
+  state.latestMessageEventId = Math.max(state.latestMessageEventId || 0, latestMessageEventId(state.data.messages));
+}
+
+function chatLogElement() {
+  return document.querySelector(".mesh-chat-log");
+}
+
+function chatIsNearBottom(element) {
+  if (!element) {
+    return true;
+  }
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+}
+
+function stickCurrentChatToBottom() {
+  const scrollToBottom = () => {
+    const element = chatLogElement();
+    if (element) {
+      element.scrollTop = element.scrollHeight;
+    }
+  };
+  scrollToBottom();
+  window.requestAnimationFrame(scrollToBottom);
+  window.setTimeout(scrollToBottom, 0);
+  window.setTimeout(scrollToBottom, 140);
+}
+
+function renderChatWithScroll({ forceBottom = false } = {}) {
+  const currentLog = chatLogElement();
+  const shouldStick = forceBottom || chatIsNearBottom(currentLog);
+  const bottomOffset = currentLog ? currentLog.scrollHeight - currentLog.scrollTop : 0;
+  renderView();
+  renderNodeModal();
+  const nextLog = chatLogElement();
+  if (!nextLog) {
+    return;
+  }
+  if (shouldStick) {
+    stickCurrentChatToBottom();
+    return;
+  }
+  nextLog.scrollTop = Math.max(0, nextLog.scrollHeight - bottomOffset);
+}
+
+async function pollChatMessages() {
+  const sinceId = state.latestMessageEventId || latestMessageEventId(state.data.messages);
+  try {
+    const payload = await apiFetch(`/messages?since_id=${encodeURIComponent(sinceId)}&limit=200`);
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    if (!messages.length) {
+      return;
+    }
+    mergeMessages(messages);
+    if (state.view === "chat") {
+      renderChatWithScroll();
+    }
+  } catch (error) {
+    setNotice(error.message || "Failed to load new chat messages.", "error");
+    renderNotice();
+  }
+}
+
+function initialsForName(name) {
+  const text = String(name || "").trim();
+  if (!text) {
+    return "?";
+  }
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (parts.length === 1) {
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+  return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+}
+
+function renderMeshChatMessage(message) {
+  const direction = String(message?.direction || "inbound").trim().toLowerCase();
+  const roleClass = direction === "outbound" ? "assistant" : "user";
+  const fromName = nodeDisplayName(message?.from);
+  const toName = nodeDisplayName(message?.to);
+  const activeEntity = message?.from || {};
+  const displayName = nodeDisplayName(activeEntity, roleClass === "assistant" ? "Tater" : "Unknown");
+  const body = String(message?.text || "").trim();
+  const meta = `${direction || "message"} · ${fromName} -> ${toName} · ${formatTs(message?.timestamp)}`;
+  const nodeId = nodeIdFromEntity(activeEntity);
+  const nodeNum = nodeNumFromEntity(activeEntity);
+  const clickAttrs = `
+    data-action-click="open-chat-node"
+    data-message-key="${escapeHtml(messageDomKey(message))}"
+    data-node-side="from"
+    data-node-id="${escapeHtml(nodeId)}"
+    data-node-num="${escapeHtml(nodeNum || "")}"
+  `;
+  const avatarHtml = `
+    <button class="chat-avatar node-link" type="button" ${clickAttrs} aria-label="View ${escapeHtml(displayName)} node details">
+      <div class="chat-avatar-fallback ${roleClass === "user" ? "user" : ""}">${escapeHtml(initialsForName(displayName))}</div>
+    </button>
+  `;
+  const bubbleHtml = `
+    <div class="bubble ${escapeHtml(roleClass)}">
+      <button class="role node-name-button" type="button" ${clickAttrs}>${escapeHtml(displayName)}</button>
+      <div class="bubble-body ${body ? "" : "empty"}">${body ? escapeHtml(body) : "No text payload on this packet."}</div>
+      <div class="mesh-chat-message-meta">${escapeHtml(meta)}</div>
+    </div>
+  `;
+
+  return `
+    <article class="chat-row ${escapeHtml(roleClass)}">
+      ${roleClass === "user" ? `${bubbleHtml}${avatarHtml}` : `${avatarHtml}${bubbleHtml}`}
     </article>
   `;
 }
@@ -697,170 +1084,819 @@ function renderRadio() {
 }
 
 function renderChat() {
-  const messages = [...(state.data.messages || [])].reverse();
+  const allMessages = [...(state.data.messages || [])].sort(compareMessages);
+  const channelRows = channelRowsForChat(allMessages);
+  const activeChannel = activeChatChannel(channelRows, allMessages);
+  const activeRow = channelRows.find((row) => row.key === activeChannel) || channelRows[0] || { key: "0", name: "Channel 0", count: 0 };
+  const messages = allMessages.filter((message) => messageChannelKey(message) === activeRow.key);
   return `
-    <section class="panel">
-      <div class="section-head">
-        <div>
-          <h3>Read-Only Message Log</h3>
-          <p>This view mirrors mesh traffic seen by the bridge. It does not provide a send box.</p>
+    <section class="mesh-chat-shell">
+      <aside class="mesh-channel-rail" aria-label="Meshtastic channels">
+        <div class="mesh-channel-rail-head">
+          <div class="mesh-channel-title">Channels</div>
+          <div class="mesh-channel-count">${escapeHtml(channelRows.length)} total</div>
         </div>
-      </div>
-      <div class="message-list">
-        ${messages.length ? messages.map((item) => messageCard(item)).join("") : `<div class="muted">No messages recorded yet.</div>`}
+        <div class="mesh-channel-list">
+          ${
+            channelRows.length
+              ? channelRows
+                  .map(
+                    (channel) => `
+                      <button
+                        type="button"
+                        class="mesh-channel-tab ${channel.key === activeRow.key ? "active" : ""}"
+                        data-chat-channel="${escapeHtml(channel.key)}"
+                      >
+                        <span class="mesh-channel-hash">#</span>
+                        <span class="mesh-channel-main">
+                          <span class="mesh-channel-name">${escapeHtml(channel.name)}</span>
+                          <span class="mesh-channel-sub">${escapeHtml(channel.role || `index ${channel.key}`)}</span>
+                        </span>
+                        <span class="mesh-channel-badge">${escapeHtml(channel.count)}</span>
+                      </button>
+                    `
+                  )
+                  .join("")
+              : `<div class="muted">No channels have been seen yet.</div>`
+          }
+        </div>
+      </aside>
+
+      <div class="mesh-chat-panel">
+        <div class="mesh-chat-head">
+          <div>
+            <h3># ${escapeHtml(activeRow.name)}</h3>
+            <p>Read-only mesh traffic on channel ${escapeHtml(activeRow.key)}.</p>
+          </div>
+          <span class="status-pill ${messages.length ? "ok" : "warn"}">${escapeHtml(messages.length)} message${messages.length === 1 ? "" : "s"}</span>
+        </div>
+        <div class="chat-log mesh-chat-log">
+          ${messages.length ? messages.map((item) => renderMeshChatMessage(item)).join("") : `<div class="mesh-chat-empty">No messages recorded on this channel yet.</div>`}
+        </div>
       </div>
     </section>
   `;
 }
 
-function nodeRow(node) {
-  const label = node.long_name || node.short_name || node.node_id || "Unknown";
+function renderNodeJsonSection(title, value, open = false) {
+  if (!hasObjectKeys(value) && !Array.isArray(value)) {
+    return "";
+  }
   return `
-    <tr>
-      <td>${escapeHtml(label)}</td>
-      <td>${escapeHtml(node.node_id || "")}</td>
-      <td>${escapeHtml(node.live ? "live" : "history")}</td>
-      <td>${escapeHtml(node.last_heard ? formatTs(node.last_heard) : formatTs(node.last_seen))}</td>
-      <td>${escapeHtml(node.sighting_count || 0)}</td>
-      <td><button class="inline-btn secondary-btn" type="button" data-node-id="${escapeHtml(node.node_id || "")}">History</button></td>
-    </tr>
+    <details class="node-json-section" ${open ? "open" : ""}>
+      <summary>${escapeHtml(title)}</summary>
+      <div class="code-block">${escapeHtml(prettyJson(value))}</div>
+    </details>
+  `;
+}
+
+function renderNodeModalHistory(modal) {
+  if (modal.loading) {
+    return `<div class="muted">Loading recent node history...</div>`;
+  }
+  if (modal.error) {
+    return `<div class="notice error">${escapeHtml(modal.error)}</div>`;
+  }
+  const history = Array.isArray(modal.history) ? modal.history : [];
+  if (!history.length) {
+    return `<div class="muted">No stored history for this node yet.</div>`;
+  }
+  return history
+    .slice(0, 12)
+    .map(
+      (item) => `
+        <article class="node-modal-history-item">
+          <div class="history-meta">
+            <span>${escapeHtml(item.event_type || "event")}</span>
+            <span>${escapeHtml(formatTs(item.timestamp))}</span>
+          </div>
+          <div class="node-modal-history-title">
+            ${escapeHtml(firstNonEmpty(item.long_name, item.short_name, item.payload?.text, "Node sighting"))}
+          </div>
+          ${renderNodeJsonSection("Payload", item.payload || {}, false)}
+        </article>
+      `
+    )
+    .join("");
+}
+
+function renderNodeModal() {
+  const root = document.getElementById("modal-root");
+  if (!root) {
+    return;
+  }
+  const modal = state.nodeModal || {};
+  if (!modal.open) {
+    root.innerHTML = "";
+    return;
+  }
+
+  const identity = {
+    ...(modal.entity || {}),
+    node_id: firstNonEmpty(modal.nodeId, modal.entity?.node_id),
+    num: modal.nodeNum || nodeNumFromEntity(modal.entity),
+  };
+  const known = findKnownNode(identity) || {};
+  const packetEntity = modal.entity || {};
+  const title = nodeDisplayName(identity);
+  const subtitle = nodeSubtitle(identity);
+  const nodeId = firstNonEmpty(known.node_id, nodeIdFromEntity(identity));
+  const nodeNum = nodeNumFromEntity(known) || nodeNumFromEntity(identity);
+  const position = known.position || known.raw?.position || {};
+  const lastPayload = known.last_payload || {};
+  const rawNode = known.raw || {};
+  const stateLabel = known.live ? "Live now" : known.node_id ? "Stored node" : "Packet only";
+
+  root.innerHTML = `
+    <div class="node-modal-backdrop" data-modal-close="node">
+      <section class="node-modal-card" role="dialog" aria-modal="true" aria-labelledby="node-modal-title">
+        <div class="node-modal-head">
+          <div class="node-modal-title-wrap">
+            <div class="chat-avatar node-modal-avatar">
+              <div class="chat-avatar-fallback">${escapeHtml(initialsForName(title))}</div>
+            </div>
+            <div>
+              <h3 id="node-modal-title">${escapeHtml(title)}</h3>
+              <p>${escapeHtml(subtitle)}</p>
+            </div>
+          </div>
+          <div class="node-modal-actions">
+            <span class="status-pill ${known.live ? "ok" : "warn"}">${escapeHtml(stateLabel)}</span>
+            <button class="inline-btn secondary-btn" type="button" data-action-click="close-node-modal">Close</button>
+          </div>
+        </div>
+
+        <div class="node-modal-body">
+          <section class="node-modal-section">
+            <h4>Node Info</h4>
+            <div class="meta-list">
+              ${renderMetaRows([
+                { label: "Long Name", value: firstNonEmpty(known.long_name, packetEntity.long_name, packetEntity.longName) },
+                { label: "Short Name", value: firstNonEmpty(known.short_name, packetEntity.short_name, packetEntity.shortName) },
+                { label: "Node ID", value: nodeId },
+                { label: "Numeric ID", value: nodeNum || "" },
+                { label: "State", value: stateLabel },
+                { label: "First Seen", value: known.first_seen ? formatTs(known.first_seen) : "" },
+                { label: "Last Seen", value: firstNonEmpty(known.last_heard, known.last_seen) ? formatTs(firstNonEmpty(known.last_heard, known.last_seen)) : "" },
+                { label: "Sightings", value: known.sighting_count || "" },
+                { label: "Last Event", value: known.last_event_type || "" },
+                { label: "SNR", value: known.snr || "" },
+                { label: "Hops Away", value: known.hops_away ?? "" },
+              ])}
+            </div>
+          </section>
+
+          <section class="node-modal-section">
+            <h4>Position</h4>
+            <div class="meta-list">
+              ${renderMetaRows([
+                { label: "Latitude", value: firstNonEmpty(position.latitude, position.lat) },
+                { label: "Longitude", value: firstNonEmpty(position.longitude, position.lon, position.lng) },
+                { label: "Altitude", value: firstNonEmpty(position.altitude, position.altitudeI, position.alt) },
+                { label: "Time", value: firstNonEmpty(position.time, position.timestamp) ? formatTs(firstNonEmpty(position.time, position.timestamp)) : "" },
+              ]) || `<div class="muted">No position data stored for this node.</div>`}
+            </div>
+          </section>
+
+          <section class="node-modal-section node-modal-wide">
+            <h4>Raw Details</h4>
+            ${renderNodeJsonSection("Clicked Packet Node", packetEntity, true)}
+            ${renderNodeJsonSection("Known Node Record", known, false)}
+            ${renderNodeJsonSection("Last Payload", lastPayload, false)}
+            ${renderNodeJsonSection("Live Raw Node", rawNode, false)}
+          </section>
+
+          <section class="node-modal-section node-modal-wide">
+            <h4>Recent History</h4>
+            <div class="node-modal-history-list">
+              ${renderNodeModalHistory(modal)}
+            </div>
+          </section>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function normalizeCoordinate(value, maxAbs) {
+  const parsed = firstFiniteNumber(value);
+  if (parsed === null) {
+    return null;
+  }
+  if (Math.abs(parsed) > maxAbs && Math.abs(parsed) <= maxAbs * 10000000) {
+    return parsed / 10000000;
+  }
+  return parsed;
+}
+
+function positionFromObject(position, fallbackTimestamp = "") {
+  if (!position || typeof position !== "object") {
+    return null;
+  }
+  const lat = normalizeCoordinate(
+    firstNonEmpty(position.latitude, position.lat, position.latitudeI, position.latitude_i, position.latitudeE7, position.latitude_e7),
+    90
+  );
+  const lon = normalizeCoordinate(
+    firstNonEmpty(position.longitude, position.lon, position.lng, position.longitudeI, position.longitude_i, position.longitudeE7, position.longitude_e7),
+    180
+  );
+  if (lat === null || lon === null || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+    return null;
+  }
+  const altitude = firstFiniteNumber(position.altitude, position.altitudeI, position.alt);
+  return {
+    lat,
+    lon,
+    altitude,
+    timestamp: firstNonEmpty(position.timestamp, position.time, fallbackTimestamp),
+  };
+}
+
+function payloadPosition(payload, fallbackTimestamp = "") {
+  const candidates = [
+    payload?.position,
+    payload?.raw?.decoded?.position,
+    payload?.raw?.position,
+    payload?.decoded?.position,
+  ];
+  for (const candidate of candidates) {
+    const position = positionFromObject(candidate, fallbackTimestamp || payload?.timestamp);
+    if (position) {
+      return position;
+    }
+  }
+  return null;
+}
+
+function nodePosition(node, history = []) {
+  const candidates = [
+    { position: positionFromObject(node?.position, firstNonEmpty(node?.last_heard, node?.last_seen)), source: "Live node position" },
+    { position: payloadPosition(node?.last_payload, node?.last_payload?.timestamp), source: "Last packet position" },
+    ...history.map((item) => ({
+      position: payloadPosition(item?.payload, item?.timestamp),
+      source: `${labelizeName(item?.event_type || "history")} history`,
+    })),
+  ];
+  const match = candidates.find((item) => item.position);
+  return match ? { ...match.position, source: match.source } : null;
+}
+
+function formatCoordinate(value) {
+  return Number.isFinite(value) ? value.toFixed(5) : "";
+}
+
+function mapUrlForPosition(position) {
+  if (!position) {
+    return "";
+  }
+  return `https://www.openstreetmap.org/?mlat=${encodeURIComponent(position.lat)}&mlon=${encodeURIComponent(position.lon)}#map=16/${encodeURIComponent(position.lat)}/${encodeURIComponent(position.lon)}`;
+}
+
+function positionedNodeRows(nodes, selected) {
+  const selectedId = String(selected?.node_id || "");
+  const rows = nodes
+    .map((node) => ({ node, position: nodePosition(node) }))
+    .filter((row) => row.position);
+  const selectedPosition = nodePosition(selected, state.nodeHistory);
+  if (selectedId && selectedPosition && !rows.some((row) => String(row.node.node_id || "") === selectedId)) {
+    rows.push({ node: selected, position: selectedPosition });
+  }
+  return rows;
+}
+
+function mapViewForPositions(rows, selectedPosition) {
+  if (!rows.length && !selectedPosition) {
+    return { centerLat: 0, centerLon: 0, latSpan: 1, lonSpan: 1 };
+  }
+  if (selectedPosition) {
+    const maxLatDelta = rows.reduce((max, row) => Math.max(max, Math.abs(row.position.lat - selectedPosition.lat)), 0);
+    const maxLonDelta = rows.reduce((max, row) => Math.max(max, Math.abs(row.position.lon - selectedPosition.lon)), 0);
+    return {
+      centerLat: selectedPosition.lat,
+      centerLon: selectedPosition.lon,
+      latSpan: Math.max(0.02, maxLatDelta * 2.4),
+      lonSpan: Math.max(0.02, maxLonDelta * 2.4),
+    };
+  }
+  const lats = rows.map((row) => row.position.lat);
+  const lons = rows.map((row) => row.position.lon);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  return {
+    centerLat: (minLat + maxLat) / 2,
+    centerLon: (minLon + maxLon) / 2,
+    latSpan: Math.max(0.02, (maxLat - minLat) * 1.4),
+    lonSpan: Math.max(0.02, (maxLon - minLon) * 1.4),
+  };
+}
+
+function projectMapPosition(position, view) {
+  const x = 50 + ((position.lon - view.centerLon) / view.lonSpan) * 100;
+  const y = 50 - ((position.lat - view.centerLat) / view.latSpan) * 100;
+  return {
+    x: Math.min(96, Math.max(4, x)),
+    y: Math.min(96, Math.max(4, y)),
+  };
+}
+
+function nodeStatusClass(node) {
+  return node?.live ? "live" : "history";
+}
+
+function renderNodeListItem(node, selectedId) {
+  const nodeId = String(node?.node_id || "");
+  const position = nodePosition(node);
+  const isSelected = nodeId && nodeId === selectedId;
+  return `
+    <button
+      type="button"
+      class="node-list-item ${isSelected ? "active" : ""}"
+      data-node-id="${escapeHtml(nodeId)}"
+    >
+      <span class="node-status-dot ${escapeHtml(nodeStatusClass(node))}"></span>
+      <span class="node-list-main">
+        <span class="node-list-name">${escapeHtml(nodeDisplayName(node))}</span>
+        <span class="node-list-sub">${escapeHtml(firstNonEmpty(node.short_name, nodeId, "Unknown node"))}</span>
+      </span>
+      <span class="node-list-meta">
+        <span>${escapeHtml(node.live ? "Live" : "Past")}</span>
+        <span>${position ? "Mapped" : "No GPS"}</span>
+      </span>
+    </button>
+  `;
+}
+
+function renderNodeMap(rows, selected) {
+  const selectedPosition = nodePosition(selected, state.nodeHistory);
+  const view = mapViewForPositions(rows, selectedPosition);
+  const selectedId = String(selected?.node_id || "");
+  return `
+    <div class="node-map-stage" id="node-map-stage" role="region" aria-label="Last known node locations">
+      <div id="node-leaflet-map" class="node-leaflet-map"></div>
+      <div class="node-map-grid" aria-hidden="true"></div>
+      <div class="node-map-compass">N</div>
+      <div class="node-map-center">
+        ${escapeHtml(formatCoordinate(view.centerLat))}, ${escapeHtml(formatCoordinate(view.centerLon))}
+      </div>
+      <div class="node-map-fallback">
+        ${
+          rows.length
+            ? rows
+                .map((row) => {
+                  const projected = projectMapPosition(row.position, view);
+                  const nodeId = String(row.node.node_id || "");
+                  const selectedClass = nodeId && nodeId === selectedId ? "selected" : "";
+                  return `
+                    <button
+                      type="button"
+                      class="node-map-marker ${escapeHtml(selectedClass)} ${escapeHtml(nodeStatusClass(row.node))}"
+                      style="left: ${escapeHtml(projected.x)}%; top: ${escapeHtml(projected.y)}%;"
+                      data-node-id="${escapeHtml(nodeId)}"
+                      title="${escapeHtml(nodeDisplayName(row.node))}"
+                    >
+                      <span>${escapeHtml(initialsForName(nodeDisplayName(row.node)))}</span>
+                    </button>
+                  `;
+                })
+                .join("")
+            : `<div class="node-map-empty">No node locations have been received yet.</div>`
+        }
+      </div>
+    </div>
+  `;
+}
+
+function renderSelectedNodeInfo(selected) {
+  if (!selected?.node_id) {
+    return `<div class="muted">Select a node to view details.</div>`;
+  }
+  const position = nodePosition(selected, state.nodeHistory);
+  const mapUrl = mapUrlForPosition(position);
+  return `
+    <article class="node-detail-card">
+      <div class="section-head">
+        <div>
+          <h3>${escapeHtml(nodeDisplayName(selected))}</h3>
+          <p>${escapeHtml(nodeSubtitle(selected))}</p>
+        </div>
+        <span class="status-pill ${selected.live ? "ok" : "warn"}">${escapeHtml(selected.live ? "Live now" : "Past node")}</span>
+      </div>
+      <div class="meta-list">
+        ${renderMetaRows([
+          { label: "Node ID", value: selected.node_id || "" },
+          { label: "Numeric ID", value: selected.num || "" },
+          { label: "First Seen", value: selected.first_seen ? formatTs(selected.first_seen) : "" },
+          { label: "Last Seen", value: firstNonEmpty(selected.last_heard, selected.last_seen) ? formatTs(firstNonEmpty(selected.last_heard, selected.last_seen)) : "" },
+          { label: "Sightings", value: selected.sighting_count || "" },
+          { label: "SNR", value: selected.snr || "" },
+          { label: "Hops Away", value: selected.hops_away ?? "" },
+          { label: "Location Source", value: position?.source || "" },
+          { label: "Latitude", value: position ? formatCoordinate(position.lat) : "" },
+          { label: "Longitude", value: position ? formatCoordinate(position.lon) : "" },
+          { label: "Altitude", value: position?.altitude ?? "" },
+          { label: "Position Time", value: position?.timestamp ? formatTs(position.timestamp) : "" },
+          { label: "Open Map", value: mapUrl ? `<a href="${escapeHtml(mapUrl)}" target="_blank" rel="noopener">Open in OpenStreetMap</a>` : "", html: true },
+        ]) || `<div class="muted">No details are available for this node yet.</div>`}
+      </div>
+    </article>
+  `;
+}
+
+function historySummary(item) {
+  const payload = item?.payload || {};
+  const position = payloadPosition(payload, item?.timestamp);
+  return [
+    payload.text ? `Text: ${payload.text}` : "",
+    payload.channel !== undefined ? `Channel ${payload.channel}` : "",
+    payload.delivery ? `Delivery: ${payload.delivery}` : "",
+    payload.portnum ? `Port: ${payload.portnum}` : "",
+    position ? `Location: ${formatCoordinate(position.lat)}, ${formatCoordinate(position.lon)}` : "",
+  ].filter(Boolean);
+}
+
+function renderNodeHistoryItem(item) {
+  const summary = historySummary(item);
+  return `
+    <article class="node-event-card">
+      <div class="history-meta">
+        <span>${escapeHtml(labelizeName(item?.event_type || "event"))}</span>
+        <span>${escapeHtml(formatTs(item?.timestamp))}</span>
+      </div>
+      <div class="node-event-title">${escapeHtml(firstNonEmpty(item?.long_name, item?.short_name, item?.payload?.from?.long_name, item?.payload?.text, "Node update"))}</div>
+      ${
+        summary.length
+          ? `<div class="chip-row">${summary.map((bit) => `<span class="chip">${escapeHtml(bit)}</span>`).join("")}</div>`
+          : `<p class="muted">No extra details on this event.</p>`
+      }
+    </article>
   `;
 }
 
 function renderNodes() {
   const nodes = state.data.nodes || [];
-  const selected = nodes.find((item) => item.node_id === state.selectedNodeId) || {};
+  const selected = nodes.find((item) => item.node_id === state.selectedNodeId) || nodes[0] || {};
+  const selectedId = String(selected?.node_id || "");
+  const locatedRows = positionedNodeRows(nodes, selected);
+  const liveCount = nodes.filter((node) => node.live).length;
   return `
-    <section class="split-grid">
-      <section class="table-panel">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Node ID</th>
-              <th>State</th>
-              <th>Last Seen</th>
-              <th>Sightings</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            ${nodes.length ? nodes.map((item) => nodeRow(item)).join("") : `<tr><td colspan="6" class="muted">No nodes recorded yet.</td></tr>`}
-          </tbody>
-        </table>
-      </section>
-
-      <section class="panel">
+    <section class="nodes-workspace">
+      <aside class="node-list-panel">
         <div class="section-head">
           <div>
-            <h3>${escapeHtml(selected.long_name || selected.short_name || selected.node_id || "Node history")}</h3>
-            <p>Past sightings, updates, and packets for the selected node.</p>
+            <h3>Mesh Nodes</h3>
+            <p>${escapeHtml(nodes.length)} known · ${escapeHtml(liveCount)} live · ${escapeHtml(locatedRows.length)} mapped</p>
           </div>
         </div>
-        <div class="node-history-list">
-          ${
-            state.nodeHistory.length
-              ? state.nodeHistory
-                  .map(
-                    (item) => `
-                      <article class="history-item">
-                        <div class="history-meta">
-                          <span>${escapeHtml(item.event_type || "event")}</span>
-                          <span>${escapeHtml(formatTs(item.timestamp))}</span>
-                        </div>
-                        <div class="code-block">${escapeHtml(prettyJson(item.payload || {}))}</div>
-                      </article>
-                    `
-                  )
-                  .join("")
-              : `<div class="muted">Select a node to load its history.</div>`
-          }
+        <div class="node-list">
+          ${nodes.length ? nodes.map((node) => renderNodeListItem(node, selectedId)).join("") : `<div class="muted">No nodes recorded yet.</div>`}
         </div>
+      </aside>
+
+      <section class="node-map-panel">
+        <div class="section-head">
+          <div>
+            <h3>Live Node Map</h3>
+            <p>Click a node in the list or map to center on its last known location.</p>
+          </div>
+          <span class="status-pill ${locatedRows.length ? "ok" : "warn"}">${escapeHtml(locatedRows.length)} located</span>
+        </div>
+        ${renderNodeMap(locatedRows, selected)}
+        ${renderSelectedNodeInfo(selected)}
+        <section class="node-history-panel">
+          <div class="section-head">
+            <div>
+              <h3>Recent Activity</h3>
+              <p>Readable events for the selected node. Raw packet JSON is hidden here to keep this view useful.</p>
+            </div>
+          </div>
+          <div class="node-history-list compact">
+            ${state.nodeHistory.length ? state.nodeHistory.map((item) => renderNodeHistoryItem(item)).join("") : `<div class="muted">Select a node to load its history.</div>`}
+          </div>
+        </section>
       </section>
     </section>
   `;
 }
 
-function renderChannels() {
-  const channels = state.data.channels || [];
-  const urls = state.data.device?.urls || {};
+function destroyNodeMap() {
+  if (nodeMapState.map) {
+    nodeMapState.map.remove();
+  }
+  nodeMapState.map = null;
+  nodeMapState.markers = [];
+  nodeMapState.container = null;
+}
+
+function nodeMapPopupHtml(row) {
+  const position = row.position;
+  const node = row.node || {};
   return `
-    <section class="panel">
-      <div class="section-head">
+    <div class="node-map-popup">
+      <strong>${escapeHtml(nodeDisplayName(node))}</strong>
+      <span>${escapeHtml(firstNonEmpty(node.short_name, node.node_id, "Unknown node"))}</span>
+      <span>${escapeHtml(node.live ? "Live now" : "Past node")} · ${escapeHtml(formatCoordinate(position.lat))}, ${escapeHtml(formatCoordinate(position.lon))}</span>
+      ${position.altitude !== null && position.altitude !== undefined ? `<span>Altitude ${escapeHtml(position.altitude)}m</span>` : ""}
+    </div>
+  `;
+}
+
+function nodeLeafletIcon(node, selected) {
+  const L = window.L;
+  const classes = ["node-leaflet-marker", nodeStatusClass(node)];
+  if (selected) {
+    classes.push("selected");
+  }
+  return L.divIcon({
+    className: "",
+    html: `<div class="${escapeHtml(classes.join(" "))}"><span>${escapeHtml(initialsForName(nodeDisplayName(node)))}</span></div>`,
+    iconSize: selected ? [48, 48] : [38, 38],
+    iconAnchor: selected ? [24, 24] : [19, 19],
+    popupAnchor: [0, selected ? -24 : -19],
+  });
+}
+
+async function selectNodeFromMap(nodeId) {
+  const token = String(nodeId || "").trim();
+  if (!token) {
+    return;
+  }
+  state.selectedNodeId = token;
+  await loadNodeHistory(token);
+  render();
+}
+
+function syncRealNodeMap() {
+  const stage = document.getElementById("node-map-stage");
+  const container = document.getElementById("node-leaflet-map");
+  if (state.view !== "nodes" || !stage || !container) {
+    destroyNodeMap();
+    return;
+  }
+
+  if (!window.L) {
+    stage.classList.remove("leaflet-ready");
+    stage.classList.add("leaflet-unavailable");
+    return;
+  }
+
+  const nodes = state.data.nodes || [];
+  const selected = nodes.find((item) => item.node_id === state.selectedNodeId) || nodes[0] || {};
+  const selectedId = String(selected?.node_id || "");
+  const rows = positionedNodeRows(nodes, selected);
+  const selectedPosition = nodePosition(selected, state.nodeHistory);
+
+  if (nodeMapState.container !== container) {
+    destroyNodeMap();
+  }
+  if (!nodeMapState.map) {
+    nodeMapState.map = window.L.map(container, {
+      zoomControl: true,
+      attributionControl: true,
+      scrollWheelZoom: true,
+    });
+    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(nodeMapState.map);
+    nodeMapState.container = container;
+  }
+
+  nodeMapState.markers.forEach((marker) => marker.remove());
+  nodeMapState.markers = [];
+  rows.forEach((row) => {
+    const nodeId = String(row.node.node_id || "");
+    const isSelected = nodeId && nodeId === selectedId;
+    const marker = window.L.marker([row.position.lat, row.position.lon], {
+      icon: nodeLeafletIcon(row.node, isSelected),
+      title: nodeDisplayName(row.node),
+    });
+    marker.bindPopup(nodeMapPopupHtml(row));
+    marker.on("click", () => {
+      if (nodeId && nodeId !== state.selectedNodeId) {
+        selectNodeFromMap(nodeId).catch((error) => setNotice(error.message || "Failed to select node.", "error"));
+      }
+    });
+    marker.addTo(nodeMapState.map);
+    nodeMapState.markers.push(marker);
+  });
+
+  if (selectedPosition) {
+    nodeMapState.map.setView([selectedPosition.lat, selectedPosition.lon], Math.max(nodeMapState.map.getZoom() || 0, 13), { animate: true });
+  } else if (rows.length) {
+    const bounds = window.L.latLngBounds(rows.map((row) => [row.position.lat, row.position.lon]));
+    nodeMapState.map.fitBounds(bounds, { padding: [42, 42], maxZoom: 13, animate: true });
+  } else {
+    nodeMapState.map.setView([0, 0], 2);
+  }
+
+  stage.classList.add("leaflet-ready");
+  stage.classList.remove("leaflet-unavailable");
+  window.requestAnimationFrame(() => {
+    if (nodeMapState.map) {
+      nodeMapState.map.invalidateSize();
+    }
+  });
+}
+
+function sortedChannels(channels) {
+  return [...(channels || [])].sort((a, b) => {
+    const aIndex = Number.parseInt(String(a?.index ?? "0"), 10);
+    const bIndex = Number.parseInt(String(b?.index ?? "0"), 10);
+    return aIndex - bIndex || channelName(a).localeCompare(channelName(b));
+  });
+}
+
+function activeChannel(channels) {
+  const saved = String(state.selectedChannelIndex || "").trim();
+  const active = channels.find((channel) => String(channel?.index ?? "") === saved) || channels[0] || null;
+  if (active) {
+    state.selectedChannelIndex = String(active.index ?? "");
+    safeStorageSet("tater_meshtastic_bridge_selected_channel", state.selectedChannelIndex);
+  }
+  return active;
+}
+
+function channelDirty(channel) {
+  return Boolean(state.configDirty[configDraftKey("channel", String(channel?.index ?? ""))]);
+}
+
+function renderChannelTabs(channels, activeIndex) {
+  return `
+    <aside class="channel-rail" aria-label="Meshtastic channel list">
+      <div class="channel-rail-head">
         <div>
-          <h3>Channel Summary</h3>
-          <p>Export URLs and edit channel settings with typed controls instead of raw protobuf JSON.</p>
+          <h3>Channels</h3>
+          <p>${escapeHtml(channels.length)} configured</p>
         </div>
       </div>
-      <div class="meta-list">
-        ${renderMetaRows([
-          { label: "Primary URL", value: urls.primary || "" },
-          { label: "Full URL", value: urls.all || "" },
-        ])}
-      </div>
-    </section>
-
-    <section class="channel-grid">
-      ${
-        channels.length
-          ? channels
-              .map(
-                (channel) => {
-                  const section = String(channel.index);
-                  const schema = getConfigSchema("channel", section);
-                  const draft = getConfigDraft("channel", section, channel.raw || {});
-                  const dirty = Boolean(state.configDirty[configDraftKey("channel", section)]);
+      <div class="channel-tab-list">
+        ${
+          channels.length
+            ? channels
+                .map((channel) => {
+                  const index = String(channel?.index ?? "");
+                  const dirty = channelDirty(channel);
                   return `
-                  <article class="channel-card">
-                    <form data-action="save-config-section" data-scope="channel" data-section="${escapeHtml(section)}" class="config-section-form">
-                      <div class="section-head">
-                        <div>
-                          <h3>${escapeHtml(channel.name || `Channel ${channel.index}`)}</h3>
-                          <p>${escapeHtml(channel.role || "UNKNOWN")} · index ${escapeHtml(channel.index)}</p>
-                        </div>
-                        <div class="chip-row">
-                          <span class="chip ${dirty ? "chip-warn" : ""}">${escapeHtml(dirty ? "Unsaved changes" : "Saved")}</span>
-                        </div>
-                      </div>
-                      ${
-                        schema?.kind === "message"
-                          ? renderConfigMessageFields("channel", section, schema, [], draft)
-                          : `
-                              <div class="field">
-                                <label for="channel-json-${escapeHtml(channel.index)}">Channel JSON</label>
-                                <textarea id="channel-json-${escapeHtml(channel.index)}" name="config_json">${escapeHtml(prettyJson(draft || {}))}</textarea>
-                              </div>
-                            `
-                      }
-                      <details class="config-advanced">
-                        <summary>Advanced JSON preview</summary>
-                        <div class="code-block">${escapeHtml(prettyJson(draft || {}))}</div>
-                      </details>
-                      <div class="action-row">
-                        <button
-                          class="inline-btn secondary-btn"
-                          type="button"
-                          data-action-click="reset-config-section"
-                          data-scope="channel"
-                          data-section="${escapeHtml(section)}"
-                        >
-                          Reset Changes
-                        </button>
-                        <button class="action-btn" type="submit">Save Channel</button>
-                        ${
-                          Number(channel.index) > 0
-                            ? `<button class="action-btn danger-btn" type="button" data-action-click="delete-channel" data-index="${escapeHtml(channel.index)}">Delete Secondary Channel</button>`
-                            : ``
-                        }
-                      </div>
-                    </form>
-                  </article>
-                `;
-                }
-              )
-              .join("")
-          : `<div class="muted">No channel details are available yet.</div>`
-      }
+                    <button
+                      type="button"
+                      class="channel-tab ${index === activeIndex ? "active" : ""}"
+                      data-channel-tab="${escapeHtml(index)}"
+                    >
+                      <span class="channel-tab-index">${escapeHtml(index || "?")}</span>
+                      <span class="channel-tab-main">
+                        <span class="channel-tab-name">${escapeHtml(channelName(channel))}</span>
+                        <span class="channel-tab-sub">${escapeHtml(channel?.role || "UNKNOWN")}${dirty ? " · unsaved" : ""}</span>
+                      </span>
+                    </button>
+                  `;
+                })
+                .join("")
+            : `<div class="muted">No channel details are available yet.</div>`
+        }
+      </div>
+    </aside>
+  `;
+}
+
+function renderChannelEditor(channel) {
+  if (!channel) {
+    return `<article class="panel"><div class="muted">No channel details are available yet.</div></article>`;
+  }
+  const section = String(channel.index);
+  const schema = getConfigSchema("channel", section);
+  const draft = getConfigDraft("channel", section, channel.raw || {});
+  const dirty = channelDirty(channel);
+  return `
+    <article class="channel-editor-card">
+      <form data-action="save-config-section" data-scope="channel" data-section="${escapeHtml(section)}" class="config-section-form">
+        <div class="section-head">
+          <div>
+            <h3>${escapeHtml(channelName(channel))}</h3>
+            <p>${escapeHtml(channel.role || "UNKNOWN")} · channel index ${escapeHtml(section)}</p>
+          </div>
+          <div class="chip-row">
+            <span class="chip ${dirty ? "chip-warn" : ""}">${escapeHtml(dirty ? "Unsaved changes" : "Saved")}</span>
+            ${Number(channel.index) === 0 ? `<span class="chip">Primary</span>` : `<span class="chip">Secondary</span>`}
+          </div>
+        </div>
+        <div class="channel-info-strip">
+          <div>
+            <span>Name</span>
+            <strong>${escapeHtml(channelName(channel))}</strong>
+          </div>
+          <div>
+            <span>Role</span>
+            <strong>${escapeHtml(channel.role || "UNKNOWN")}</strong>
+          </div>
+          <div>
+            <span>Index</span>
+            <strong>${escapeHtml(section)}</strong>
+          </div>
+        </div>
+        ${
+          schema?.kind === "message"
+            ? renderConfigMessageFields("channel", section, schema, [], draft)
+            : `
+                <div class="field">
+                  <label for="channel-json-${escapeHtml(section)}">Channel JSON</label>
+                  <textarea id="channel-json-${escapeHtml(section)}" name="config_json">${escapeHtml(prettyJson(draft || {}))}</textarea>
+                </div>
+              `
+        }
+        <details class="config-advanced">
+          <summary>Advanced JSON preview</summary>
+          <div class="code-block">${escapeHtml(prettyJson(draft || {}))}</div>
+        </details>
+        <div class="action-row">
+          <button
+            class="inline-btn secondary-btn"
+            type="button"
+            data-action-click="reset-config-section"
+            data-scope="channel"
+            data-section="${escapeHtml(section)}"
+          >
+            Reset Changes
+          </button>
+          <button class="action-btn" type="submit">Save Channel</button>
+          ${
+            Number(channel.index) > 0
+              ? `<button class="action-btn danger-btn" type="button" data-action-click="delete-channel" data-index="${escapeHtml(section)}">Delete Secondary Channel</button>`
+              : ``
+          }
+        </div>
+      </form>
+    </article>
+  `;
+}
+
+function renderChannels() {
+  const channels = sortedChannels(state.data.channels || []);
+  const selected = activeChannel(channels);
+  const selectedIndex = String(selected?.index ?? "");
+  const urls = state.data.device?.urls || {};
+  const dirtyCount = channels.filter((channel) => channelDirty(channel)).length;
+  return `
+    <section class="channel-workspace">
+      <section class="panel channel-overview-panel">
+        <div class="section-head">
+          <div>
+            <h3>Channel Management</h3>
+            <p>Pick one channel to inspect or edit. Import/export URLs stay here so the editor stays focused.</p>
+          </div>
+          <div class="chip-row">
+            <span class="chip">${escapeHtml(channels.length)} channels</span>
+            ${dirtyCount ? `<span class="chip chip-warn">${escapeHtml(dirtyCount)} unsaved</span>` : `<span class="chip">All saved</span>`}
+          </div>
+        </div>
+        <div class="channel-url-layout">
+          <div class="meta-list channel-url-meta">
+            ${renderMetaRows([
+              { label: "Primary URL", value: urls.primary || "" },
+              { label: "Full URL", value: urls.all || "" },
+            ]) || `<div class="muted">No channel URLs are available yet.</div>`}
+          </div>
+          <form data-action="set-channel-url" class="field-grid channel-url-form">
+            <div class="field">
+              <label for="channel-url">Import Channel URL</label>
+              <input id="channel-url" name="url" placeholder="https://meshtastic.org/..." />
+            </div>
+            <div class="field">
+              <label for="channel-url-mode">Mode</label>
+              <select id="channel-url-mode" name="add_only">
+                <option value="false">Replace channels</option>
+                <option value="true">Add new channels only</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button class="action-btn" type="submit">Apply URL</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section class="channel-browser">
+        ${renderChannelTabs(channels, selectedIndex)}
+        <div class="channel-detail">
+          ${renderChannelEditor(selected)}
+        </div>
+      </section>
     </section>
   `;
 }
@@ -1165,46 +2201,154 @@ function renderConfigSection(scope, section, value, schema) {
   `;
 }
 
-function renderConfigScope(title, description, scope, sections) {
+function configSectionLabel(scope, section) {
+  return getConfigSchema(scope, section)?.label || labelizeName(section);
+}
+
+function sortedConfigEntries(scope, sections) {
+  return Object.entries(sections || {}).sort(([sectionA], [sectionB]) => {
+    const labelA = configSectionLabel(scope, sectionA);
+    const labelB = configSectionLabel(scope, sectionB);
+    return labelA.localeCompare(labelB) || sectionA.localeCompare(sectionB);
+  });
+}
+
+function activeConfigScope(scopeGroups) {
+  const saved = String(state.configScope || "local").trim();
+  const active = scopeGroups.find((group) => group.key === saved && group.sections.length) || scopeGroups.find((group) => group.sections.length) || scopeGroups[0];
+  state.configScope = active?.key || "local";
+  safeStorageSet("tater_meshtastic_bridge_config_scope", state.configScope);
+  return active;
+}
+
+function activeConfigSection(scope, sections) {
+  const saved = String(state.configSections?.[scope] || "").trim();
+  const active = sections.find(([section]) => section === saved) || sections[0] || ["", {}];
+  const section = String(active[0] || "").trim();
+  if (section) {
+    state.configSections[scope] = section;
+    safeStorageSet(`tater_meshtastic_bridge_config_section_${scope}`, section);
+  }
+  return active;
+}
+
+function configGroupDirtyCount(scope, sections) {
+  return sections.filter(([section]) => state.configDirty[configDraftKey(scope, section)]).length;
+}
+
+function renderConfigScopeTabs(scopeGroups, activeScope) {
   return `
-    <article class="panel">
-      <div class="section-head">
+    <div class="config-scope-tabs" role="tablist" aria-label="Config groups">
+      ${scopeGroups
+        .map((group) => {
+          const dirtyCount = configGroupDirtyCount(group.key, group.sections);
+          return `
+            <button
+              type="button"
+              class="config-scope-tab ${group.key === activeScope.key ? "active" : ""}"
+              data-config-scope-tab="${escapeHtml(group.key)}"
+            >
+              <span>${escapeHtml(group.title)}</span>
+              <small>${escapeHtml(group.sections.length)} section${group.sections.length === 1 ? "" : "s"}${dirtyCount ? ` · ${dirtyCount} unsaved` : ""}</small>
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderConfigSectionTabs(scope, sections, activeSection) {
+  return `
+    <aside class="config-section-rail" aria-label="${escapeHtml(scope)} config sections">
+      <div class="config-section-rail-head">
         <div>
-          <h3>${escapeHtml(title)}</h3>
-          <p>${escapeHtml(description)}</p>
+          <h3>${escapeHtml(labelizeName(scope))}</h3>
+          <p>${escapeHtml(sections.length)} sorted sections</p>
         </div>
       </div>
-      <div class="config-stack">
+      <div class="config-section-tabs">
         ${
           sections.length
             ? sections
-                .map(([section, value]) => renderConfigSection(scope, section, value, getConfigSchema(scope, section)))
+                .map(([section]) => {
+                  const schema = getConfigSchema(scope, section);
+                  const label = configSectionLabel(scope, section);
+                  const dirty = Boolean(state.configDirty[configDraftKey(scope, section)]);
+                  const summary = schema?.fields?.length ? `${schema.fields.length} fields` : "JSON fallback";
+                  return `
+                    <button
+                      type="button"
+                      class="config-section-tab ${section === activeSection ? "active" : ""}"
+                      data-config-section-tab="${escapeHtml(section)}"
+                    >
+                      <span class="config-section-name">${escapeHtml(label)}</span>
+                      <span class="config-section-sub">${escapeHtml(summary)}${dirty ? " · unsaved" : ""}</span>
+                    </button>
+                  `;
+                })
                 .join("")
-            : `<div class="muted">No ${escapeHtml(scope)} config snapshot is available yet.</div>`
+            : `<div class="muted">No config sections are available yet.</div>`
         }
       </div>
-    </article>
+    </aside>
   `;
 }
 
 function renderConfigs() {
   const config = state.data.config || {};
-  const localSections = Object.entries(config.local || {});
-  const moduleSections = Object.entries(config.module || {});
+  const scopeGroups = [
+    {
+      key: "local",
+      title: "Local",
+      description: "Core radio behavior, LoRa, Bluetooth, network, position, display, and power settings.",
+      sections: sortedConfigEntries("local", config.local || {}),
+    },
+    {
+      key: "module",
+      title: "Module",
+      description: "Optional feature modules like telemetry, MQTT, serial, audio, canned messages, and alerts.",
+      sections: sortedConfigEntries("module", config.module || {}),
+    },
+  ];
+  const activeScope = activeConfigScope(scopeGroups);
+  const [activeSection, activeValue] = activeConfigSection(activeScope.key, activeScope.sections);
   return `
-    <section class="config-grid">
-      ${renderConfigScope(
-        "Local Config Sections",
-        "Typed controls pulled from the radio config schema. Select from valid enum values instead of editing raw JSON.",
-        "local",
-        localSections
-      )}
-      ${renderConfigScope(
-        "Module Config Sections",
-        "Module-level settings like telemetry, MQTT, serial, audio, and related features.",
-        "module",
-        moduleSections
-      )}
+    <section class="config-workspace">
+      <section class="panel config-overview-panel">
+        <div class="section-head">
+          <div>
+            <h3>Device Configs</h3>
+            <p>Pick a group and section to edit typed Meshtastic settings without scrolling through every section at once.</p>
+          </div>
+          <div class="chip-row">
+            <span class="chip">${escapeHtml(scopeGroups.reduce((total, group) => total + group.sections.length, 0))} sections</span>
+            ${
+              hasUnsavedConfigDrafts()
+                ? `<span class="chip chip-warn">${escapeHtml(Object.values(state.configDirty).filter(Boolean).length)} unsaved</span>`
+                : `<span class="chip">All saved</span>`
+            }
+          </div>
+        </div>
+        ${renderConfigScopeTabs(scopeGroups, activeScope)}
+      </section>
+
+      <section class="config-browser">
+        ${renderConfigSectionTabs(activeScope.key, activeScope.sections, activeSection)}
+        <div class="config-section-detail">
+          <div class="section-head">
+            <div>
+              <h3>${escapeHtml(activeScope.title)} Config</h3>
+              <p>${escapeHtml(activeScope.description)}</p>
+            </div>
+          </div>
+          ${
+            activeSection
+              ? renderConfigSection(activeScope.key, activeSection, activeValue, getConfigSchema(activeScope.key, activeSection))
+              : `<article class="panel"><div class="muted">No ${escapeHtml(activeScope.key)} config snapshot is available yet.</div></article>`
+          }
+        </div>
+      </section>
     </section>
   `;
 }
@@ -1340,6 +2484,8 @@ function render() {
   renderSidebarStatus();
   renderNotice();
   renderView();
+  renderNodeModal();
+  window.requestAnimationFrame(syncRealNodeMap);
 }
 
 async function handleFormSubmit(form) {
@@ -1479,12 +2625,90 @@ async function handleFormSubmit(form) {
   }
 }
 
+function closeNodeModal() {
+  state.nodeModal = {
+    open: false,
+    nodeId: "",
+    nodeNum: 0,
+    entity: {},
+    history: [],
+    loading: false,
+    error: "",
+  };
+  render();
+}
+
+async function openChatNodeModal(button) {
+  const message = findMessageByDomKey(button.dataset.messageKey);
+  const packetEntity = nodeEntityForMessage(message, button.dataset.nodeSide);
+  const fallbackEntity = {
+    node_id: button.dataset.nodeId || "",
+    num: Number.parseInt(button.dataset.nodeNum || "0", 10) || 0,
+  };
+  const entity = hasObjectKeys(packetEntity) ? packetEntity : fallbackEntity;
+  const known = findKnownNode(entity) || {};
+  const nodeId = firstNonEmpty(known.node_id, nodeIdFromEntity(entity), button.dataset.nodeId);
+  const nodeNum = nodeNumFromEntity(known) || nodeNumFromEntity(entity) || fallbackEntity.num;
+
+  state.nodeModal = {
+    open: true,
+    nodeId,
+    nodeNum,
+    entity: {
+      ...entity,
+      node_id: firstNonEmpty(nodeId, nodeIdFromEntity(entity)),
+      num: nodeNum || nodeNumFromEntity(entity),
+    },
+    history: [],
+    loading: Boolean(nodeId),
+    error: "",
+  };
+  render();
+
+  if (!nodeId) {
+    state.nodeModal.loading = false;
+    render();
+    return;
+  }
+
+  try {
+    const payload = await apiFetch(`/nodes/${encodeURIComponent(nodeId)}/history?limit=40`);
+    if (state.nodeModal.open && state.nodeModal.nodeId === nodeId) {
+      state.nodeModal.history = Array.isArray(payload.history) ? payload.history : [];
+      state.nodeModal.error = "";
+    }
+  } catch (error) {
+    if (state.nodeModal.open && state.nodeModal.nodeId === nodeId) {
+      state.nodeModal.error = error.message || "Failed to load node history.";
+    }
+  } finally {
+    if (state.nodeModal.open && state.nodeModal.nodeId === nodeId) {
+      state.nodeModal.loading = false;
+      render();
+    }
+  }
+}
+
 async function handleActionClick(button) {
   const action = String(button?.dataset?.actionClick || "").trim();
   if (!action) {
+    if (button.dataset.nodeId) {
+      await loadNodeHistory(button.dataset.nodeId);
+      render();
+    }
     return;
   }
   try {
+    if (action === "open-chat-node") {
+      await openChatNodeModal(button);
+      return;
+    }
+
+    if (action === "close-node-modal") {
+      closeNodeModal();
+      return;
+    }
+
     if (action === "reset-config-section") {
       const scope = String(button.dataset.scope || "").trim();
       const section = String(button.dataset.section || "").trim();
@@ -1588,7 +2812,11 @@ function installEventHandlers() {
   document.querySelectorAll(".nav-btn").forEach((button) => {
     button.addEventListener("click", async () => {
       state.view = button.dataset.view || "dashboard";
+      state.formDirty = false;
       render();
+      if (state.view === "chat") {
+        stickCurrentChatToBottom();
+      }
     });
   });
 
@@ -1598,6 +2826,58 @@ function installEventHandlers() {
       await loadBootstrap();
     });
   }
+
+  const handleDelegatedClick = async (event) => {
+    const element = event.target instanceof HTMLElement ? event.target : null;
+    if (element?.dataset.modalClose === "node") {
+      closeNodeModal();
+      return;
+    }
+    const target = element ? element.closest("button") : null;
+    if (!target) {
+      return;
+    }
+    if (target.dataset.chatChannel !== undefined) {
+      state.chatChannel = channelKey(target.dataset.chatChannel);
+      safeStorageSet("tater_meshtastic_bridge_chat_channel", state.chatChannel);
+      if (state.view === "chat") {
+        renderChatWithScroll({ forceBottom: true });
+      } else {
+        render();
+      }
+      return;
+    }
+    if (target.dataset.configScopeTab !== undefined) {
+      const scope = String(target.dataset.configScopeTab || "").trim();
+      if (scope) {
+        state.configScope = scope;
+        safeStorageSet("tater_meshtastic_bridge_config_scope", scope);
+        render();
+      }
+      return;
+    }
+    if (target.dataset.configSectionTab !== undefined) {
+      const section = String(target.dataset.configSectionTab || "").trim();
+      if (section) {
+        state.configSections[state.configScope] = section;
+        safeStorageSet(`tater_meshtastic_bridge_config_section_${state.configScope}`, section);
+        render();
+      }
+      return;
+    }
+    if (target.dataset.channelTab !== undefined) {
+      const index = String(target.dataset.channelTab || "").trim();
+      if (index) {
+        state.selectedChannelIndex = index;
+        safeStorageSet("tater_meshtastic_bridge_selected_channel", index);
+        render();
+      }
+      return;
+    }
+    if (target.dataset.actionClick || target.dataset.nodeId) {
+      await handleActionClick(target);
+    }
+  };
 
   const root = document.getElementById("view-root");
   if (root) {
@@ -1609,6 +2889,7 @@ function installEventHandlers() {
       if (!element) {
         return;
       }
+      markGenericFormDirty(element);
 
       if (element.dataset.configMapKey === "true" && event.type === "change") {
         const scope = String(element.dataset.scope || "").trim();
@@ -1659,35 +2940,35 @@ function installEventHandlers() {
       await handleFormSubmit(form);
     });
 
-    root.addEventListener("click", async (event) => {
-      const target = event.target instanceof HTMLElement ? event.target.closest("button") : null;
-      if (!target) {
-        return;
-      }
-      if (target.dataset.actionClick || target.dataset.nodeId) {
-        await handleActionClick(target);
-      }
-    });
+    root.addEventListener("click", handleDelegatedClick);
 
     root.addEventListener("input", handleConfigDraftInput);
     root.addEventListener("change", handleConfigDraftInput);
   }
+
+  const modalRoot = document.getElementById("modal-root");
+  if (modalRoot) {
+    modalRoot.addEventListener("click", handleDelegatedClick);
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.nodeModal.open) {
+      closeNodeModal();
+    }
+  });
 }
 
 function startPolling() {
   if (state.pollTimer) {
     window.clearInterval(state.pollTimer);
+    state.pollTimer = 0;
   }
-  state.pollTimer = window.setInterval(async () => {
-    await loadBootstrap();
-  }, 10000);
 }
 
 async function boot() {
   installEventHandlers();
   render();
   await loadBootstrap();
-  startPolling();
 }
 
 window.addEventListener("DOMContentLoaded", () => {

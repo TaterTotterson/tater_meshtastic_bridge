@@ -88,7 +88,7 @@ The Web UI is meant for bridge administration and radio inspection. It currently
 - Chat log for inbound and outbound mesh messages seen by the bridge, plus a manual broadcast bar for short radio messages
 - Node browser with current nodes, past nodes, direct-message composer, and per-node sighting history
 - Channel browser with URL export, Meshtastic-compatible QR sharing, plus per-channel JSON editing
-- Firmware tab with device detection, GitHub release lookup, firmware download cache, DFU/OTA prep actions, and guarded ESP32 WiFi/TCP OTA update support
+- Firmware tab with alpha-testing warnings, device detection, GitHub release lookup, firmware download cache, DFU/OTA prep actions, and guarded ESP32 WiFi/TCP OTA update support
 - Device + config pages for local config sections, module config sections, owner names, LoRa radio settings, canned messages, ringtone, fixed position, and GPS/position source settings
 - Settings page for BLE scanning, bridge runtime settings, API token, reconnect timing, ACK behavior, logging, next-start port, and data reset actions
 - Audit log of bridge-side write actions
@@ -127,7 +127,7 @@ The easiest path is the bridge Web UI:
 2. Go to Settings
 3. Click Scan for Devices
 4. Click Use This Device on the radio you want
-5. Click Save Bridge Settings
+5. Click Save Connection Settings
 6. Restart or reconnect the bridge so the new BLE target is used
 
 The scan button uses the same Meshtastic BLE discovery as this terminal command:
@@ -168,8 +168,23 @@ If the scan finds nothing:
 - If the bridge has an API token set, the Web UI shell still loads without auth, but the browser needs that token saved in the UI Settings tab before it can call the protected bridge APIs.
 - The bridge host is fixed to `0.0.0.0`.
 - Runtime settings live in the Web UI and are stored in SQLite.
+- Firmware tools in the Web UI are alpha/testing features. Use them at your own risk, double-check the detected hardware, and keep a known-good recovery path available.
 - Firmware downloads are cached beside the bridge database. ESP32 OTA updates use the Meshtastic CLI over WiFi/TCP and require firmware/device support; USB/Web Serial or drag-and-drop flashing is still recommended for full erase, recovery, nRF52, RP2040, and USB-only workflows.
 - `MESHTASTIC_BRIDGE_PORT` is only needed as a hard startup override when the default `8433` port is already in use. Leave it unset for normal UI-managed port changes.
 - `MESHTASTIC_DATABASE_PATH` remains a startup-only override for where the bridge keeps its SQLite history, snapshots, and UI-managed settings. Leaving it blank uses a platform-appropriate app-data path.
 - The bridge now records text, node updates, radio log lines, and common packet types like `position`, `user`, and `data` when the Meshtastic client publishes them.
 - `MESHTASTIC_SHUTDOWN_TIMEOUT_SECONDS` can be changed from the Web UI and controls how long the bridge waits for BLE cleanup before continuing shutdown if the Bluetooth stack is hung.
+
+## Local data and privacy
+
+The bridge stores runtime settings, chat history, node snapshots, sightings, audit logs, and firmware download metadata in SQLite. By default this database lives in the platform app-data folder, not in the Git checkout.
+
+The repository `.gitignore` also protects common local/sensitive files if you choose to keep data inside the project folder:
+
+- `.env`, `.env.local`, and other local env variants
+- `.venv/`, Python caches, and build outputs
+- SQLite databases and WAL/SHM sidecar files
+- Local `data/`, `firmware/`, `cache/`, `.cache/`, and `instance/` folders
+- Logs and macOS/editor-local files
+
+`.env.example` is intentionally tracked as the safe template.

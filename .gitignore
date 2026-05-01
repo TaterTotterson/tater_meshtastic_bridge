@@ -1,12 +1,44 @@
 # macOS
 .DS_Store
 **/.DS_Store
-/__pycache__/
-**/__pycache__/
 
-# Local bridge files
-/.env
+# Python local/build output
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
 /.venv/
-/*.egg-info/
+
+# Local bridge data, history, and downloaded firmware
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/bridge.sqlite3*
+/data/
+/firmware/
+/cache/
+/.cache/
+/instance/
+
+# Logs and local scratch
+*.log
+/logs/
 /test/
 /tests/
+
+# Editor/project-local files
+.idea/
+.vscode/
+*.swp

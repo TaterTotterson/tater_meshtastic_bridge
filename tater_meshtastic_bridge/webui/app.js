@@ -1,9 +1,10 @@
 const VIEW_META = {
   dashboard: { title: "Dashboard", subtitle: "Live status, stats, and recent mesh activity." },
   radio: { title: "Radio", subtitle: "Owner details, URLs, canned text, position, and device actions." },
-  chat: { title: "Chat", subtitle: "Read-only Meshtastic traffic seen by the bridge." },
-  nodes: { title: "Nodes", subtitle: "Current mesh nodes, past nodes, and sighting history." },
+  chat: { title: "Chat", subtitle: "Meshtastic traffic plus a manual broadcast bar for quick radio messages." },
+  nodes: { title: "Nodes", subtitle: "Current mesh nodes, direct messages, past nodes, and sighting history." },
   channels: { title: "Channels", subtitle: "Inspect channel state, import/export URLs, and edit channel records." },
+  firmware: { title: "Firmware", subtitle: "Detect the radio, download firmware, and run guarded update actions." },
   configs: { title: "Configs", subtitle: "Browse and edit local and module config sections on the radio." },
   audit: { title: "Audit", subtitle: "Track bridge-side configuration changes and admin actions." },
   settings: { title: "Settings", subtitle: "Bridge console auth, refresh behavior, and local preferences." },
@@ -24,11 +25,18 @@ const state = {
     status: {},
     stats: {},
     device: {},
+    settings: {},
     config: {},
     channels: [],
     nodes: [],
     messages: [],
     audit: [],
+  },
+  channelShare: {
+    loading: false,
+    loaded: false,
+    error: "",
+    shares: [],
   },
   selectedNodeId: "",
   nodeHistory: [],
@@ -50,6 +58,21 @@ const state = {
   formDirty: false,
   configDrafts: {},
   configDirty: {},
+  bleScan: {
+    loading: false,
+    devices: null,
+    scannedAt: "",
+    error: "",
+  },
+  firmware: {
+    status: null,
+    releases: [],
+    files: [],
+    loadingReleases: false,
+    loadingFiles: false,
+    includePrerelease: safeStorageGet("tater_meshtastic_bridge_firmware_prerelease", "false") === "true",
+    error: "",
+  },
 };
 
 const ROOT_PATH = (() => {
@@ -58,6 +81,47 @@ const ROOT_PATH = (() => {
 })();
 const API_BASE = `${ROOT_PATH}/api`;
 const MAX_CHAT_MESSAGES = 500;
+const LORA_REGION_FALLBACK_OPTIONS = [
+  "UNSET",
+  "US",
+  "EU_433",
+  "EU_868",
+  "CN",
+  "JP",
+  "ANZ",
+  "KR",
+  "TW",
+  "RU",
+  "IN",
+  "NZ_865",
+  "TH",
+  "LORA_24",
+  "UA_433",
+  "UA_868",
+  "MY_433",
+  "MY_919",
+  "SG_923",
+  "PH_433",
+  "PH_868",
+  "PH_915",
+  "ANZ_433",
+  "KZ_433",
+  "KZ_863",
+  "NP_865",
+  "BR_902",
+];
+const LORA_MODEM_PRESET_FALLBACK_OPTIONS = [
+  "LONG_FAST",
+  "LONG_SLOW",
+  "VERY_LONG_SLOW",
+  "MEDIUM_SLOW",
+  "MEDIUM_FAST",
+  "SHORT_SLOW",
+  "SHORT_FAST",
+  "LONG_MODERATE",
+  "SHORT_TURBO",
+  "LONG_TURBO",
+];
 const nodeMapState = {
   map: null,
   markers: [],
@@ -183,6 +247,37 @@ function getConfigSourceValue(scope, section) {
     return getChannelBySection(section)?.raw || {};
   }
   return state.data.config?.[scope]?.[section] || {};
+}
+
+function getConfigFieldSchema(scope, section, fieldName) {
+  const schema = getConfigSchema(scope, section);
+  return (schema?.fields || []).find((field) => field.name === fieldName) || null;
+}
+
+function enumOptionValues(scope, section, fieldName, fallbackValues = []) {
+  const field = getConfigFieldSchema(scope, section, fieldName);
+  const options = Array.isArray(field?.options) && field.options.length ? field.options.map((option) => option.value) : fallbackValues;
+  return options.map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function renderEnumOptions(currentValue, values) {
+  return values
+    .map((value) => `<option value="${escapeHtml(value)}" ${selectedAttr(currentValue, value)}>${escapeHtml(labelizeName(value))}</option>`)
+    .join("");
+}
+
+function valueWithDefault(source, fieldName, fallback) {
+  if (source && Object.prototype.hasOwnProperty.call(source, fieldName)) {
+    return source[fieldName];
+  }
+  return fallback;
+}
+
+function intListFromText(value) {
+  return String(value || "")
+    .split(/[\s,]+/)
+    .map((part) => Number.parseInt(part, 10))
+    .filter((part) => Number.isFinite(part));
 }
 
 function defaultValueForSchema(schema) {
@@ -325,9 +420,9 @@ function renderNotice() {
   root.innerHTML = `<div class="notice ${kind}">${escapeHtml(state.notice.message)}</div>`;
 }
 
-function withAuthHeaders(headers = {}) {
+function withAuthHeaders(headers = {}, authToken = undefined) {
   const out = { Accept: "application/json", ...headers };
-  const token = String(state.token || "").trim();
+  const token = String(authToken === undefined ? state.token || "" : authToken || "").trim();
   if (token) {
     out.Authorization = `Bearer ${token}`;
   }
@@ -335,9 +430,10 @@ function withAuthHeaders(headers = {}) {
 }
 
 async function apiFetch(path, options = {}) {
+  const { authToken, ...fetchOptions } = options || {};
   const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: withAuthHeaders(options.headers || {}),
+    ...fetchOptions,
+    headers: withAuthHeaders(fetchOptions.headers || {}, authToken),
   });
 
   let payload = null;
@@ -348,7 +444,10 @@ async function apiFetch(path, options = {}) {
   }
 
   if (!response.ok) {
-    const detail = payload && payload.detail ? payload.detail : `Request failed (${response.status})`;
+    let detail = payload && payload.detail ? payload.detail : `Request failed (${response.status})`;
+    if (response.status === 401 && String(detail).toLowerCase().includes("token")) {
+      detail = "Bridge API token required. In Settings, save the current Bridge API Token in Browser Access Token, then try again.";
+    }
     throw new Error(String(detail));
   }
   return payload || {};
@@ -399,6 +498,7 @@ async function loadBootstrap({ force = true } = {}) {
       status: payload.status || {},
       stats: payload.stats || {},
       device: payload.device || {},
+      settings: payload.settings || {},
       config: payload.config || {},
       channels: Array.isArray(payload.channels) ? payload.channels : [],
       nodes: Array.isArray(payload.nodes) ? payload.nodes : [],
@@ -733,6 +833,18 @@ function renderChatWithScroll({ forceBottom = false } = {}) {
   nextLog.scrollTop = Math.max(0, nextLog.scrollHeight - bottomOffset);
 }
 
+function handleChatComposerKeydown(event) {
+  const target = event.target instanceof HTMLTextAreaElement ? event.target : null;
+  if (!target || !["mesh-chat-input", "node-direct-message-input"].includes(target.id)) {
+    return;
+  }
+  if (event.key !== "Enter" || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey || event.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  target.closest("form")?.requestSubmit();
+}
+
 async function pollChatMessages() {
   const sinceId = state.latestMessageEventId || latestMessageEventId(state.data.messages);
   try {
@@ -922,11 +1034,163 @@ function renderDashboard() {
   `;
 }
 
+function renderLoRaSettingsPanel() {
+  const lora = state.data.config?.local?.lora || {};
+  const regionOptions = enumOptionValues("local", "lora", "region", LORA_REGION_FALLBACK_OPTIONS);
+  const presetOptions = enumOptionValues("local", "lora", "modem_preset", LORA_MODEM_PRESET_FALLBACK_OPTIONS);
+  const loraValue = (fieldName, fallback) => valueWithDefault(lora, fieldName, fallback);
+  const boolOptions = (value) => `
+    <option value="true" ${selectedAttr(value, true)}>True</option>
+    <option value="false" ${selectedAttr(value, false)}>False</option>
+  `;
+
+  return `
+    <section class="panel lora-settings-panel">
+      <div class="section-head">
+        <div>
+          <h3>LoRa Radio Settings</h3>
+          <p>Friendly controls for region, range preset, hops, frequency slot, TX, RX boost, and advanced modem tuning.</p>
+        </div>
+        <span class="chip">Saves to local.lora</span>
+      </div>
+      <form data-action="save-lora-settings" class="lora-settings-form">
+        <div class="lora-settings-groups">
+          <section class="lora-settings-group">
+            <h4>Region & Range</h4>
+            <div class="field-grid">
+              <div class="field">
+                <label for="lora-region">Region</label>
+                <select id="lora-region" name="region">
+                  ${renderEnumOptions(firstNonEmpty(loraValue("region", "UNSET"), "UNSET"), regionOptions)}
+                </select>
+                <div class="helper">Choose the legal radio region for where this node is operating.</div>
+              </div>
+              <div class="field">
+                <label for="lora-use-preset">Use Preset</label>
+                <select id="lora-use-preset" name="use_preset">
+                  ${boolOptions(loraValue("use_preset", true))}
+                </select>
+                <div class="helper">True uses the preset/range mode instead of manual modem tuning.</div>
+              </div>
+              <div class="field">
+                <label for="lora-modem-preset">Range / Modem Preset</label>
+                <select id="lora-modem-preset" name="modem_preset">
+                  ${renderEnumOptions(firstNonEmpty(loraValue("modem_preset", "LONG_FAST"), "LONG_FAST"), presetOptions)}
+                </select>
+              </div>
+              <div class="field">
+                <label for="lora-hop-limit">Hop Limit</label>
+                <input id="lora-hop-limit" name="hop_limit" type="number" min="0" step="1" value="${escapeHtml(loraValue("hop_limit", 3))}" />
+              </div>
+            </div>
+          </section>
+
+          <section class="lora-settings-group">
+            <h4>Frequency & Power</h4>
+            <div class="field-grid">
+              <div class="field">
+                <label for="lora-channel-num">Frequency Slot</label>
+                <input id="lora-channel-num" name="channel_num" type="number" min="0" step="1" value="${escapeHtml(loraValue("channel_num", 0))}" />
+                <div class="helper">Meshtastic calls this channel_num internally.</div>
+              </div>
+              <div class="field">
+                <label for="lora-tx-enabled">TX Enabled</label>
+                <select id="lora-tx-enabled" name="tx_enabled">
+                  ${boolOptions(loraValue("tx_enabled", true))}
+                </select>
+              </div>
+              <div class="field">
+                <label for="lora-tx-power">TX Power</label>
+                <input id="lora-tx-power" name="tx_power" type="number" step="1" value="${escapeHtml(loraValue("tx_power", 0))}" />
+                <div class="helper">0 lets firmware choose the default where supported.</div>
+              </div>
+              <div class="field">
+                <label for="lora-rx-boost">RX Boosted Gain</label>
+                <select id="lora-rx-boost" name="sx126x_rx_boosted_gain">
+                  ${boolOptions(loraValue("sx126x_rx_boosted_gain", false))}
+                </select>
+              </div>
+              <div class="field">
+                <label for="lora-override-frequency">Override Frequency</label>
+                <input id="lora-override-frequency" name="override_frequency" type="number" step="any" value="${escapeHtml(loraValue("override_frequency", 0))}" />
+                <div class="helper">Leave 0 unless you know you need a custom frequency.</div>
+              </div>
+              <div class="field">
+                <label for="lora-frequency-offset">Frequency Offset</label>
+                <input id="lora-frequency-offset" name="frequency_offset" type="number" step="any" value="${escapeHtml(loraValue("frequency_offset", 0))}" />
+              </div>
+            </div>
+          </section>
+
+          <section class="lora-settings-group">
+            <h4>Advanced Modem</h4>
+            <div class="field-grid">
+              <div class="field">
+                <label for="lora-bandwidth">Bandwidth</label>
+                <input id="lora-bandwidth" name="bandwidth" type="number" min="0" step="1" value="${escapeHtml(loraValue("bandwidth", 0))}" />
+              </div>
+              <div class="field">
+                <label for="lora-spread-factor">Spread Factor</label>
+                <input id="lora-spread-factor" name="spread_factor" type="number" min="0" step="1" value="${escapeHtml(loraValue("spread_factor", 0))}" />
+              </div>
+              <div class="field">
+                <label for="lora-coding-rate">Coding Rate</label>
+                <input id="lora-coding-rate" name="coding_rate" type="number" min="0" step="1" value="${escapeHtml(loraValue("coding_rate", 0))}" />
+              </div>
+              <div class="field">
+                <label for="lora-duty-cycle">Override Duty Cycle</label>
+                <select id="lora-duty-cycle" name="override_duty_cycle">
+                  ${boolOptions(loraValue("override_duty_cycle", false))}
+                </select>
+              </div>
+              <div class="field">
+                <label for="lora-pa-fan-disabled">PA Fan Disabled</label>
+                <select id="lora-pa-fan-disabled" name="pa_fan_disabled">
+                  ${boolOptions(loraValue("pa_fan_disabled", false))}
+                </select>
+              </div>
+            </div>
+          </section>
+
+          <section class="lora-settings-group">
+            <h4>Mesh / MQTT Filters</h4>
+            <div class="field-grid">
+              <div class="field">
+                <label for="lora-ignore-mqtt">Ignore MQTT</label>
+                <select id="lora-ignore-mqtt" name="ignore_mqtt">
+                  ${boolOptions(loraValue("ignore_mqtt", false))}
+                </select>
+              </div>
+              <div class="field">
+                <label for="lora-config-ok-mqtt">Config OK To MQTT</label>
+                <select id="lora-config-ok-mqtt" name="config_ok_to_mqtt">
+                  ${boolOptions(loraValue("config_ok_to_mqtt", false))}
+                </select>
+              </div>
+              <div class="field lora-wide-field">
+                <label for="lora-ignore-incoming">Ignore Incoming Node Numbers</label>
+                <textarea id="lora-ignore-incoming" name="ignore_incoming" rows="3" placeholder="123456789, 987654321">${escapeHtml((loraValue("ignore_incoming", []) || []).join(", "))}</textarea>
+                <div class="helper">Optional comma-separated numeric node IDs to ignore at the LoRa layer.</div>
+              </div>
+            </div>
+          </section>
+        </div>
+        <div class="action-row">
+          <button class="action-btn" type="submit">Save LoRa Settings</button>
+          <span class="helper">Changing region, frequency, or modem settings can temporarily disconnect or desync nodes.</span>
+        </div>
+      </form>
+    </section>
+  `;
+}
+
 function renderRadio() {
   const status = state.data.status || {};
   const device = state.data.device || {};
   const localNode = device?.local_node || status?.local_node || {};
   const urls = device?.urls || {};
+  const positionConfig = state.data.config?.local?.position || {};
+  const gpsMode = normalizedGpsMode(positionConfig.gps_mode);
 
   return `
     <section class="split-grid">
@@ -993,6 +1257,8 @@ function renderRadio() {
       </section>
     </section>
 
+    ${renderLoRaSettingsPanel()}
+
     <section class="split-grid">
       <section class="panel">
         <div class="section-head">
@@ -1021,6 +1287,77 @@ function renderRadio() {
         </form>
       </section>
 
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <h3>GPS / Position Source</h3>
+            <p>Switch between the onboard GPS and a fixed/manual position override.</p>
+          </div>
+        </div>
+        <form data-action="save-position-settings" class="field-grid">
+          <div class="field">
+            <label for="position-gps-mode">GPS Mode</label>
+            <select id="position-gps-mode" name="gps_mode">
+              <option value="DISABLED" ${selectedAttr(gpsMode, "DISABLED")}>GPS disabled</option>
+              <option value="ENABLED" ${selectedAttr(gpsMode, "ENABLED")}>Use GPS</option>
+              <option value="NOT_PRESENT" ${selectedAttr(gpsMode, "NOT_PRESENT")}>No GPS hardware</option>
+            </select>
+            <div class="helper">Use GPS means the radio can use live satellite position when supported.</div>
+          </div>
+          <div class="field">
+            <label for="position-gps-enabled">GPS Enabled</label>
+            <select id="position-gps-enabled" name="gps_enabled">
+              <option value="true" ${selectedAttr(firstNonEmpty(positionConfig.gps_enabled, false), true)}>True</option>
+              <option value="false" ${selectedAttr(firstNonEmpty(positionConfig.gps_enabled, false), false)}>False</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="position-fixed-position">Fixed Position Override</label>
+            <select id="position-fixed-position" name="fixed_position">
+              <option value="false" ${selectedAttr(firstNonEmpty(positionConfig.fixed_position, false), false)}>False</option>
+              <option value="true" ${selectedAttr(firstNonEmpty(positionConfig.fixed_position, false), true)}>True</option>
+            </select>
+            <div class="helper">True keeps reporting the saved fixed coordinates instead of live GPS.</div>
+          </div>
+          <div class="field">
+            <label for="position-broadcast-secs">Broadcast Every Seconds</label>
+            <input id="position-broadcast-secs" name="position_broadcast_secs" type="number" min="0" step="1" value="${escapeHtml(firstNonEmpty(positionConfig.position_broadcast_secs, 0))}" />
+          </div>
+          <div class="field">
+            <label for="position-smart-enabled">Smart Broadcast</label>
+            <select id="position-smart-enabled" name="position_broadcast_smart_enabled">
+              <option value="true" ${selectedAttr(firstNonEmpty(positionConfig.position_broadcast_smart_enabled, false), true)}>True</option>
+              <option value="false" ${selectedAttr(firstNonEmpty(positionConfig.position_broadcast_smart_enabled, false), false)}>False</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="position-gps-update-interval">GPS Update Interval</label>
+            <input id="position-gps-update-interval" name="gps_update_interval" type="number" min="0" step="1" value="${escapeHtml(firstNonEmpty(positionConfig.gps_update_interval, 0))}" />
+          </div>
+          <div class="field">
+            <label for="position-gps-attempt-time">GPS Attempt Time</label>
+            <input id="position-gps-attempt-time" name="gps_attempt_time" type="number" min="0" step="1" value="${escapeHtml(firstNonEmpty(positionConfig.gps_attempt_time, 0))}" />
+          </div>
+          <div class="field">
+            <label for="position-smart-distance">Smart Minimum Distance</label>
+            <input id="position-smart-distance" name="broadcast_smart_minimum_distance" type="number" min="0" step="1" value="${escapeHtml(firstNonEmpty(positionConfig.broadcast_smart_minimum_distance, 0))}" />
+          </div>
+          <div class="field">
+            <label for="position-smart-interval">Smart Minimum Interval</label>
+            <input id="position-smart-interval" name="broadcast_smart_minimum_interval_secs" type="number" min="0" step="1" value="${escapeHtml(firstNonEmpty(positionConfig.broadcast_smart_minimum_interval_secs, 0))}" />
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <button class="action-btn" type="submit">Save GPS Settings</button>
+          </div>
+        </form>
+        <div class="helper">
+          For live GPS, use Fixed Position Override = False, GPS Enabled = True, and GPS Mode = Use GPS. For a manual location, save coordinates and set Fixed Position Override = True.
+        </div>
+      </section>
+    </section>
+
+    <section class="split-grid">
       <section class="panel">
         <div class="section-head">
           <div>
@@ -1084,11 +1421,13 @@ function renderRadio() {
 }
 
 function renderChat() {
+  const status = state.data.status || {};
   const allMessages = [...(state.data.messages || [])].sort(compareMessages);
   const channelRows = channelRowsForChat(allMessages);
   const activeChannel = activeChatChannel(channelRows, allMessages);
   const activeRow = channelRows.find((row) => row.key === activeChannel) || channelRows[0] || { key: "0", name: "Channel 0", count: 0 };
   const messages = allMessages.filter((message) => messageChannelKey(message) === activeRow.key);
+  const connected = Boolean(status.connected);
   return `
     <section class="mesh-chat-shell">
       <aside class="mesh-channel-rail" aria-label="Meshtastic channels">
@@ -1126,13 +1465,38 @@ function renderChat() {
         <div class="mesh-chat-head">
           <div>
             <h3># ${escapeHtml(activeRow.name)}</h3>
-            <p>Read-only mesh traffic on channel ${escapeHtml(activeRow.key)}.</p>
+            <p>Mesh traffic on channel ${escapeHtml(activeRow.key)}. Use the composer below for manual sends.</p>
           </div>
           <span class="status-pill ${messages.length ? "ok" : "warn"}">${escapeHtml(messages.length)} message${messages.length === 1 ? "" : "s"}</span>
         </div>
         <div class="chat-log mesh-chat-log">
           ${messages.length ? messages.map((item) => renderMeshChatMessage(item)).join("") : `<div class="mesh-chat-empty">No messages recorded on this channel yet.</div>`}
         </div>
+        <form data-action="send-chat" class="chat-composer-card mesh-chat-composer-card">
+          <input type="hidden" name="channel" value="${escapeHtml(activeRow.key)}" />
+          <div class="mesh-chat-send-meta">
+            <span>Broadcasting on # ${escapeHtml(activeRow.name)}</span>
+          </div>
+          <div class="chat-composer" role="group" aria-label="Meshtastic chat composer">
+            <div class="chat-composer-bar">
+              <textarea
+                id="mesh-chat-input"
+                class="chat-composer-input"
+                name="text"
+                rows="1"
+                maxlength="200"
+                placeholder="${connected ? `Message # ${escapeHtml(activeRow.name)}...` : "Radio disconnected"}"
+                ${connected ? "" : "disabled"}
+              ></textarea>
+              <button type="submit" class="chat-composer-send" title="Send mesh message" aria-label="Send mesh message" ${connected ? "" : "disabled"}>
+                <span class="chat-composer-icon chat-composer-send-arrow" aria-hidden="true">Send</span>
+              </button>
+            </div>
+            <div class="mesh-chat-composer-help">
+              Keep it short for mesh. Enter sends, Shift+Enter adds a line. Direct messages live on the Nodes tab.
+            </div>
+          </div>
+        </form>
       </div>
     </section>
   `;
@@ -1359,6 +1723,21 @@ function formatCoordinate(value) {
   return Number.isFinite(value) ? value.toFixed(5) : "";
 }
 
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  let size = bytes;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
 function mapUrlForPosition(position) {
   if (!position) {
     return "";
@@ -1486,8 +1865,20 @@ function renderSelectedNodeInfo(selected) {
   if (!selected?.node_id) {
     return `<div class="muted">Select a node to view details.</div>`;
   }
+  const status = state.data.status || {};
   const position = nodePosition(selected, state.nodeHistory);
   const mapUrl = mapUrlForPosition(position);
+  const connected = Boolean(status.connected);
+  const channels = sortedChannels(state.data.channels || []);
+  const defaultChannel = channelKey(state.chatChannel || channels[0]?.index || 0);
+  const channelOptions = channels.length
+    ? channels
+        .map((channel) => {
+          const key = channelKey(channel.index ?? 0);
+          return `<option value="${escapeHtml(key)}" ${selectedAttr(defaultChannel, key)}># ${escapeHtml(channelName(channel))}</option>`;
+        })
+        .join("")
+    : `<option value="0"># Channel 0</option>`;
   return `
     <article class="node-detail-card">
       <div class="section-head">
@@ -1514,6 +1905,44 @@ function renderSelectedNodeInfo(selected) {
           { label: "Open Map", value: mapUrl ? `<a href="${escapeHtml(mapUrl)}" target="_blank" rel="noopener">Open in OpenStreetMap</a>` : "", html: true },
         ]) || `<div class="muted">No details are available for this node yet.</div>`}
       </div>
+    </article>
+    <article class="node-direct-message-card">
+      <div class="section-head compact-head">
+        <div>
+          <h3>Direct Message</h3>
+          <p>Send a short manual message straight to ${escapeHtml(nodeDisplayName(selected))}.</p>
+        </div>
+        <span class="status-pill ${connected ? "ok" : "warn"}">${escapeHtml(connected ? "Radio connected" : "Radio disconnected")}</span>
+      </div>
+      <form data-action="send-node-message" class="node-direct-message-form">
+        <input type="hidden" name="destination" value="${escapeHtml(selected.node_id || "")}" />
+        <div class="mesh-chat-send-meta">
+          <span>Destination: ${escapeHtml(selected.node_id || "")}</span>
+          <label>
+            Channel
+            <select name="channel" ${connected ? "" : "disabled"}>
+              ${channelOptions}
+            </select>
+          </label>
+        </div>
+        <div class="chat-composer" role="group" aria-label="Direct Meshtastic message composer">
+          <div class="chat-composer-bar">
+            <textarea
+              id="node-direct-message-input"
+              class="chat-composer-input"
+              name="text"
+              rows="1"
+              maxlength="200"
+              placeholder="${connected ? `Message ${escapeHtml(nodeDisplayName(selected))}...` : "Radio disconnected"}"
+              ${connected ? "" : "disabled"}
+            ></textarea>
+            <button type="submit" class="chat-composer-send" title="Send direct message" aria-label="Send direct message" ${connected ? "" : "disabled"}>
+              <span class="chat-composer-icon chat-composer-send-arrow" aria-hidden="true">Send</span>
+            </button>
+          </div>
+          <div class="mesh-chat-composer-help">Direct messages still ride over the selected Meshtastic channel. Keep them short.</div>
+        </div>
+      </form>
     </article>
   `;
 }
@@ -1845,6 +2274,50 @@ function renderChannelEditor(channel) {
   `;
 }
 
+function renderChannelSharePanel() {
+  const shareState = state.channelShare || {};
+  const shares = Array.isArray(shareState.shares) ? shareState.shares : [];
+  const body = shareState.error
+    ? `<div class="notice error">${escapeHtml(shareState.error)}</div>`
+    : shares.length
+      ? `
+          <div class="channel-share-grid">
+            ${shares
+              .map((share) => {
+                const url = String(share.url || "").trim();
+                return `
+                  <article class="channel-share-card">
+                    <div class="channel-share-qr" aria-label="${escapeHtml(share.label || "Channel")} QR code">
+                      ${share.svg || ""}
+                    </div>
+                    <div class="channel-share-copy">
+                      <h4>${escapeHtml(share.label || "Channel QR")}</h4>
+                      <p>${escapeHtml(share.description || "Scan from the Meshtastic app to import this channel information.")}</p>
+                      <textarea readonly>${escapeHtml(url)}</textarea>
+                    </div>
+                  </article>
+                `;
+              })
+              .join("")}
+          </div>
+        `
+      : `<div class="muted">Generate QR codes after the bridge has a channel URL snapshot. Use Refresh from the Channels tab if the radio just connected.</div>`;
+  return `
+    <section class="panel channel-share-panel">
+      <div class="section-head">
+        <div>
+          <h3>Share QR Codes</h3>
+          <p>Scan these from the Meshtastic app to import this radio's channel information.</p>
+        </div>
+        <button class="action-btn" type="button" data-action-click="load-channel-share" ${shareState.loading ? "disabled" : ""}>
+          ${shareState.loading ? "Generating..." : shareState.loaded ? "Refresh QR" : "Generate QR"}
+        </button>
+      </div>
+      ${body}
+    </section>
+  `;
+}
+
 function renderChannels() {
   const channels = sortedChannels(state.data.channels || []);
   const selected = activeChannel(channels);
@@ -1891,10 +2364,189 @@ function renderChannels() {
         </div>
       </section>
 
+      ${renderChannelSharePanel()}
+
       <section class="channel-browser">
         ${renderChannelTabs(channels, selectedIndex)}
         <div class="channel-detail">
           ${renderChannelEditor(selected)}
+        </div>
+      </section>
+    </section>
+  `;
+}
+
+function firmwareStatusValue(label, value) {
+  return { label, value: value || "" };
+}
+
+function renderFirmwareAsset(asset, release) {
+  const matched = Number(asset.match_score || 0) > 0;
+  return `
+    <article class="firmware-asset ${matched ? "matched" : ""}">
+      <div>
+        <strong>${escapeHtml(asset.name || "Firmware asset")}</strong>
+        <div class="helper">
+          ${escapeHtml(formatBytes(asset.size))} · ${escapeHtml(asset.download_count || 0)} downloads${matched ? " · likely match" : ""}
+        </div>
+      </div>
+      <button
+        class="inline-btn"
+        type="button"
+        data-action-click="firmware-download"
+        data-asset-url="${escapeHtml(asset.browser_download_url || "")}"
+        data-asset-name="${escapeHtml(asset.name || "")}"
+        data-tag-name="${escapeHtml(release.tag_name || "")}"
+      >Download</button>
+    </article>
+  `;
+}
+
+function renderFirmwareRelease(release) {
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const matched = assets.filter((asset) => Number(asset.match_score || 0) > 0);
+  const shownAssets = matched.length ? matched : assets.slice(0, 8);
+  return `
+    <article class="firmware-release-card">
+      <div class="section-head compact-head">
+        <div>
+          <h4>${escapeHtml(release.name || release.tag_name || "Firmware Release")}</h4>
+          <p>${escapeHtml(release.tag_name || "")} · ${escapeHtml(formatTs(release.published_at))}${release.prerelease ? " · prerelease" : ""}</p>
+        </div>
+        ${release.html_url ? `<a class="inline-btn" href="${escapeHtml(release.html_url)}" target="_blank" rel="noopener">Release Notes</a>` : ""}
+      </div>
+      <div class="firmware-asset-list">
+        ${
+          shownAssets.length
+            ? shownAssets.map((asset) => renderFirmwareAsset(asset, release)).join("")
+            : `<div class="muted">No firmware-looking assets were found on this release.</div>`
+        }
+      </div>
+    </article>
+  `;
+}
+
+function renderFirmwareFileOptions(files) {
+  return files.length
+    ? files.map((file) => `<option value="${escapeHtml(file.path || "")}">${escapeHtml(file.name || "firmware")} (${escapeHtml(formatBytes(file.size))})</option>`).join("")
+    : `<option value="">No downloaded firmware files</option>`;
+}
+
+function renderFirmware() {
+  const fw = state.firmware || {};
+  const status = fw.status || {};
+  const releases = Array.isArray(fw.releases) ? fw.releases : [];
+  const files = Array.isArray(fw.files) ? fw.files : [];
+  const candidates = Array.isArray(status.target_candidates) ? status.target_candidates : [];
+  return `
+    <section class="firmware-workspace">
+      <section class="firmware-alpha-warning" role="alert">
+        <div>
+          <strong>Alpha testing warning</strong>
+          <p>
+            Firmware tools in the bridge are experimental and should be used at your own risk. Double-check the detected hardware, keep a known-good recovery path available, and prefer the official Meshtastic Web Flasher for anything critical.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel firmware-status-panel">
+        <div class="section-head">
+          <div>
+            <h3>Firmware Detection</h3>
+            <p>Detect the connected radio and match release assets where possible.</p>
+          </div>
+          <div class="chip-row">
+            <button class="inline-btn" type="button" data-action-click="firmware-refresh-status">Refresh Detection</button>
+            <a class="inline-btn" href="https://flasher.meshtastic.org/" target="_blank" rel="noopener">Open Web Flasher</a>
+          </div>
+        </div>
+        ${fw.error ? `<div class="notice error">${escapeHtml(fw.error)}</div>` : ""}
+        <div class="meta-list">
+          ${renderMetaRows([
+            firmwareStatusValue("Connected", status.connected ? "Yes" : "No"),
+            firmwareStatusValue("Transport", status.transport || ""),
+            firmwareStatusValue("Firmware Version", status.firmware_version || ""),
+            firmwareStatusValue("Hardware Model", status.hardware_model || ""),
+            firmwareStatusValue("Device Role", status.device_role || ""),
+            firmwareStatusValue("Firmware Cache", status.cache_dir || ""),
+          ])}
+        </div>
+        <div class="chip-row firmware-candidates">
+          ${
+            candidates.length
+              ? candidates.map((candidate) => `<span class="chip">${escapeHtml(candidate)}</span>`).join("")
+              : `<span class="muted">No hardware target candidates yet. Refresh after the radio is connected.</span>`
+          }
+        </div>
+      </section>
+
+      <section class="panel firmware-release-panel">
+        <div class="section-head">
+          <div>
+            <h3>Download Firmware</h3>
+            <p>Fetch Meshtastic release assets from GitHub and download them into the bridge firmware cache.</p>
+          </div>
+          <div class="chip-row">
+            <button class="inline-btn secondary-btn" type="button" data-action-click="firmware-prerelease-toggle">
+              ${fw.includePrerelease ? "Showing prereleases" : "Stable only"}
+            </button>
+            <button class="action-btn" type="button" data-action-click="firmware-load-releases" ${fw.loadingReleases ? "disabled" : ""}>
+              ${fw.loadingReleases ? "Loading..." : "Load Releases"}
+            </button>
+          </div>
+        </div>
+        <div class="firmware-release-list">
+          ${
+            releases.length
+              ? releases.map((release) => renderFirmwareRelease(release)).join("")
+              : `<div class="muted">Load releases to see downloadable firmware assets. Matching assets are ranked first when the radio model is detected.</div>`
+          }
+        </div>
+      </section>
+
+      <section class="panel firmware-files-panel">
+        <div class="section-head">
+          <div>
+            <h3>Flash / Update</h3>
+            <p>Use downloaded firmware files for supported ESP32 WiFi/TCP OTA updates, or prep the radio for USB/DFU flashing.</p>
+          </div>
+          <button class="inline-btn" type="button" data-action-click="firmware-refresh-files" ${fw.loadingFiles ? "disabled" : ""}>
+            ${fw.loadingFiles ? "Refreshing..." : "Refresh Files"}
+          </button>
+        </div>
+        <div class="firmware-warning">
+          OTA update here uses the Meshtastic CLI and requires ESP32 firmware support plus a reachable WiFi/TCP host. For full erase, bootloader recovery, nRF52, RP2040, or USB-only boards, use the official Web Flasher or drag-and-drop flow.
+        </div>
+        <form data-action="firmware-ota-update" class="field-grid firmware-ota-form">
+          <div class="field">
+            <label for="firmware-file-path">Downloaded Firmware</label>
+            <select id="firmware-file-path" name="file_path">
+              ${renderFirmwareFileOptions(files)}
+            </select>
+          </div>
+          <div class="field">
+            <label for="firmware-tcp-host">Meshtastic TCP Host</label>
+            <input id="firmware-tcp-host" name="tcp_host" placeholder="10.4.20.210 or radio.local" />
+          </div>
+          <div class="field">
+            <label for="firmware-timeout">Timeout Seconds</label>
+            <input id="firmware-timeout" name="timeout_seconds" type="number" min="60" max="1800" step="30" value="600" />
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <button class="action-btn danger-btn" type="submit" ${files.length ? "" : "disabled"}>Start OTA Update</button>
+          </div>
+        </form>
+        <div class="firmware-file-list">
+          ${
+            files.length
+              ? files.map((file) => `<div class="firmware-file-row"><span>${escapeHtml(file.name)}</span><span>${escapeHtml(file.tag_name || "")}</span><span>${escapeHtml(formatBytes(file.size))}</span></div>`).join("")
+              : `<div class="muted">No firmware files downloaded yet.</div>`
+          }
+        </div>
+        <div class="action-row firmware-prep-actions">
+          <button class="inline-btn secondary-btn" type="button" data-action-click="firmware-device-action" data-device-action="enter_dfu_mode">Enter DFU Mode</button>
+          <button class="inline-btn secondary-btn" type="button" data-action-click="firmware-device-action" data-device-action="reboot_ota">Reboot OTA</button>
         </div>
       </section>
     </section>
@@ -2370,20 +3022,132 @@ function renderAudit() {
   `;
 }
 
-function renderSettings() {
+function selectedAttr(value, expected) {
+  return String(value) === String(expected) ? "selected" : "";
+}
+
+function normalizedGpsMode(value) {
+  const token = String(value ?? "").trim().toUpperCase();
+  if (token === "1") {
+    return "ENABLED";
+  }
+  if (token === "2") {
+    return "NOT_PRESENT";
+  }
+  if (["DISABLED", "ENABLED", "NOT_PRESENT"].includes(token)) {
+    return token;
+  }
+  return "DISABLED";
+}
+
+function sourceLabel(source) {
+  const token = String(source || "").trim().toLowerCase();
+  if (token === "ui") {
+    return "UI saved";
+  }
+  if (token === "env") {
+    return ".env override";
+  }
+  if (token === "fixed") {
+    return "Fixed";
+  }
+  return "Default";
+}
+
+function settingHelper(name, sources, extra = "") {
+  const bits = [`Source: ${sourceLabel(sources?.[name])}`];
+  if (extra) {
+    bits.push(extra);
+  }
+  return `<div class="helper">${escapeHtml(bits.join(" · "))}</div>`;
+}
+
+function renderBleScanPanel(values = {}) {
+  const scan = state.bleScan || {};
+  const devices = Array.isArray(scan.devices) ? scan.devices : null;
+  const currentAddress = String(values.device_address || "").trim();
+  const currentName = String(values.device_name || "").trim();
+  const resultsHtml = devices
+    ? devices.length
+      ? devices
+          .map((device) => {
+            const name = String(device.name || "").trim();
+            const address = String(device.address || "").trim();
+            const matchesConfig =
+              Boolean(device.matches_config) ||
+              Boolean((currentAddress && address === currentAddress) || (currentName && name === currentName));
+            return `
+              <article class="ble-device-card ${matchesConfig ? "selected" : ""}">
+                <div>
+                  <strong>${escapeHtml(name || "Unnamed Meshtastic device")}</strong>
+                  <div class="helper">${escapeHtml(address || "No BLE address reported")}</div>
+                  <div class="chip-row">
+                    ${matchesConfig ? `<span class="chip">Current target</span>` : ""}
+                    ${device.rssi !== null && device.rssi !== undefined ? `<span class="chip">RSSI ${escapeHtml(device.rssi)}</span>` : ""}
+                  </div>
+                </div>
+                <button
+                  class="inline-btn"
+                  type="button"
+                  data-action-click="select-ble-device"
+                  data-name="${escapeHtml(name)}"
+                  data-address="${escapeHtml(address)}"
+                >Use This Device</button>
+              </article>
+            `;
+          })
+          .join("")
+      : `<div class="muted">No Meshtastic BLE devices found. Make sure Bluetooth is on, the radio is advertising, and no other app is connected.</div>`
+    : `<div class="muted">Run a scan to find nearby Meshtastic BLE radios. This uses the same scan as meshtastic --ble-scan.</div>`;
   return `
-    <section class="split-grid">
-      <section class="panel">
+    <div class="ble-scan-panel">
+      <div class="section-head compact-head">
+        <div>
+          <h4>Find BLE Device</h4>
+          <p>Scan nearby Meshtastic radios and fill the bridge target without guessing the name or address.</p>
+        </div>
+        <button class="action-btn" type="button" data-action-click="ble-scan" ${scan.loading ? "disabled" : ""}>
+          ${scan.loading ? "Scanning..." : "Scan for Devices"}
+        </button>
+      </div>
+      ${scan.error ? `<div class="notice error">${escapeHtml(scan.error)}</div>` : ""}
+      ${scan.scannedAt ? `<div class="helper">Last scan: ${escapeHtml(formatTs(scan.scannedAt))}</div>` : ""}
+      <div class="ble-device-list">
+        ${resultsHtml}
+      </div>
+    </div>
+  `;
+}
+
+function renderSettings() {
+  const bridge = state.data.settings || {};
+  const values = bridge.values || {};
+  const active = bridge.active || {};
+  const sources = bridge.sources || {};
+  const envOverrides = bridge.env_overrides || {};
+  const restartRequired = Boolean(bridge.restart_required);
+  const restartKeys = new Set(bridge.restart_required_keys || []);
+  const portLocked = Boolean(envOverrides.port);
+  const restartHint = restartRequired
+    ? "Restart the bridge for pending startup settings to take effect."
+    : "Most saved settings apply right away. Startup settings are marked below.";
+  return `
+    <section class="settings-workspace">
+      <section class="panel settings-wide">
         <div class="section-head">
           <div>
-            <h3>Console Auth</h3>
-            <p>If the bridge has an API token, store it locally here so the browser can call the admin endpoints.</p>
+            <h3>Connection Settings</h3>
+            <p>Set this browser's access token, pick the BLE radio, and save the bridge connection target from one place.</p>
+          </div>
+          <div class="chip-row">
+            <span class="chip ${restartRequired ? "chip-warn" : ""}">${escapeHtml(restartHint)}</span>
           </div>
         </div>
-        <form data-action="save-token" class="field-grid">
+        <form data-action="save-token" class="field-grid browser-token-form">
           <div class="field">
-            <label for="api-token">Bearer Token</label>
-            <input id="api-token" name="token" value="${escapeHtml(state.token)}" />
+            <label for="api-token">Browser Access Token</label>
+            <input id="api-token" name="token" value="${escapeHtml(state.token)}" autocomplete="current-password" placeholder="Current Bridge API Token" />
+            <div class="helper">This is saved only in this browser. If you see "Invalid or missing API token", put the current Bridge API Token here first.</div>
           </div>
           <div class="field">
             <label for="window-hours">Stats Window (hours)</label>
@@ -2391,7 +3155,134 @@ function renderSettings() {
           </div>
           <div class="field">
             <label>&nbsp;</label>
-            <button class="action-btn" type="submit">Save Local Settings</button>
+            <div class="token-action-stack">
+              <button class="action-btn" type="submit">Save Browser Access</button>
+              <button class="inline-btn danger-btn" type="button" data-action-click="clear-api-token-local">Clear Bridge Token</button>
+            </div>
+          </div>
+        </form>
+        <form data-action="save-connection-settings" class="settings-form connection-settings-form">
+          <div class="field-grid connection-settings-grid">
+            <div class="field">
+              <label for="runtime-device-name">BLE Device Name</label>
+              <input id="runtime-device-name" name="device_name" value="${escapeHtml(values.device_name || "")}" placeholder="ThinkNode M6" />
+              ${settingHelper("device_name", sources, "Reconnect or restart after changing the target device.")}
+            </div>
+            <div class="field">
+              <label for="runtime-device-address">BLE Device Address</label>
+              <input id="runtime-device-address" name="device_address" value="${escapeHtml(values.device_address || "")}" placeholder="BLE address from meshtastic --ble-scan" />
+              ${settingHelper("device_address", sources, "Address is usually more reliable than name.")}
+            </div>
+            <div class="field runtime-scan-field">
+              ${renderBleScanPanel(values)}
+            </div>
+            <div class="field">
+              <label for="runtime-api-token">Bridge API Token</label>
+              <input id="runtime-api-token" name="api_token" value="${escapeHtml(values.api_token || "")}" autocomplete="new-password" />
+              ${settingHelper("api_token", sources, "Optional server-side token. The browser token above must match this after auth is enabled.")}
+            </div>
+          </div>
+          <div class="action-row">
+            <button class="action-btn" type="submit">Save Connection Settings</button>
+            <span class="helper">This only saves the BLE target and bridge API token. It does not require the radio to be connected.</span>
+          </div>
+        </form>
+
+        <div class="settings-subhead">
+          <h4>Advanced Runtime Settings</h4>
+          <p>These are bridge behavior and startup settings. They are separate from the BLE connection target.</p>
+        </div>
+        <form data-action="save-runtime-settings" class="settings-form">
+          <div class="field-grid runtime-settings-grid">
+            <div class="field">
+              <label for="runtime-host">Host</label>
+              <input id="runtime-host" value="${escapeHtml(values.host || "0.0.0.0")}" readonly />
+              ${settingHelper("host", sources, "Always binds on all interfaces.")}
+            </div>
+            <div class="field">
+              <label for="runtime-port">Port</label>
+              <input id="runtime-port" name="port" type="number" min="1" max="65535" value="${escapeHtml(values.port ?? 8433)}" ${portLocked ? "readonly" : ""} />
+              ${settingHelper(
+                "port",
+                sources,
+                portLocked ? "Locked by MESHTASTIC_BRIDGE_PORT until you remove it from .env." : restartKeys.has("port") ? "Restart required after changing." : "Restart required after changing."
+              )}
+            </div>
+            <div class="field">
+              <label for="runtime-log-level">Log Level</label>
+              <select id="runtime-log-level" name="log_level">
+                ${["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+                  .map((level) => `<option value="${escapeHtml(level)}" ${selectedAttr(values.log_level || "INFO", level)}>${escapeHtml(level)}</option>`)
+                  .join("")}
+              </select>
+              ${settingHelper("log_level", sources)}
+            </div>
+            <div class="field">
+              <label for="runtime-reconnect">Reconnect Seconds</label>
+              <input id="runtime-reconnect" name="reconnect_seconds" type="number" min="1" step="0.5" value="${escapeHtml(values.reconnect_seconds ?? 10)}" />
+              ${settingHelper("reconnect_seconds", sources)}
+            </div>
+            <div class="field">
+              <label for="runtime-connect-timeout">Connect Timeout Seconds</label>
+              <input id="runtime-connect-timeout" name="connect_timeout_seconds" type="number" min="5" step="1" value="${escapeHtml(values.connect_timeout_seconds ?? 60)}" />
+              ${settingHelper("connect_timeout_seconds", sources, "Used on the next BLE connection attempt.")}
+            </div>
+            <div class="field">
+              <label for="runtime-event-buffer">Event Buffer Size</label>
+              <input id="runtime-event-buffer" name="event_buffer_size" type="number" min="50" step="1" value="${escapeHtml(values.event_buffer_size ?? 500)}" />
+              ${settingHelper("event_buffer_size", sources, "Restart required to resize the in-memory buffer.")}
+            </div>
+            <div class="field">
+              <label for="runtime-hop-limit">Default Hop Limit</label>
+              <input id="runtime-hop-limit" name="default_hop_limit" type="number" step="1" value="${escapeHtml(values.default_hop_limit ?? "")}" placeholder="Use radio default" />
+              ${settingHelper("default_hop_limit", sources)}
+            </div>
+            <div class="field">
+              <label for="runtime-shutdown-timeout">Shutdown Timeout Seconds</label>
+              <input id="runtime-shutdown-timeout" name="shutdown_timeout_seconds" type="number" min="0.1" step="0.1" value="${escapeHtml(values.shutdown_timeout_seconds ?? 2)}" />
+              ${settingHelper("shutdown_timeout_seconds", sources)}
+            </div>
+            <div class="field">
+              <label for="runtime-outbound-events">Include Outbound Events</label>
+              <select id="runtime-outbound-events" name="include_outbound_events">
+                <option value="true" ${selectedAttr(Boolean(values.include_outbound_events), true)}>True</option>
+                <option value="false" ${selectedAttr(Boolean(values.include_outbound_events), false)}>False</option>
+              </select>
+              ${settingHelper("include_outbound_events", sources)}
+            </div>
+            <div class="field">
+              <label for="runtime-want-ack">Want ACK</label>
+              <select id="runtime-want-ack" name="want_ack">
+                <option value="true" ${selectedAttr(Boolean(values.want_ack), true)}>True</option>
+                <option value="false" ${selectedAttr(Boolean(values.want_ack), false)}>False</option>
+              </select>
+              ${settingHelper("want_ack", sources)}
+            </div>
+            <div class="field">
+              <label for="runtime-no-nodes">Skip Initial Node Load</label>
+              <select id="runtime-no-nodes" name="no_nodes">
+                <option value="true" ${selectedAttr(Boolean(values.no_nodes), true)}>True</option>
+                <option value="false" ${selectedAttr(Boolean(values.no_nodes), false)}>False</option>
+              </select>
+              ${settingHelper("no_nodes", sources, "Used on the next BLE connection attempt.")}
+            </div>
+            <div class="field">
+              <label for="runtime-database-path">Database Path</label>
+              <input id="runtime-database-path" value="${escapeHtml(values.database_path || "")}" readonly />
+              ${settingHelper("database_path", sources, "Startup-only; use MESHTASTIC_DATABASE_PATH to move it.")}
+            </div>
+          </div>
+          <div class="meta-list settings-active-list">
+            ${renderMetaRows([
+              { label: "Active Host", value: active.host || "" },
+              { label: "Active Port", value: active.port || "" },
+              { label: "Saved Port", value: values.port || "" },
+              { label: "Restart Needed", value: restartRequired ? "Yes" : "No" },
+            ])}
+          </div>
+          <div class="action-row">
+            <button class="action-btn" type="submit">Save Advanced Settings</button>
+            <button class="inline-btn danger-btn" type="button" data-action-click="clear-runtime-settings">Clear Saved Settings</button>
           </div>
         </form>
       </section>
@@ -2410,6 +3301,22 @@ function renderSettings() {
             { label: "Current View", value: state.view },
             { label: "Selected Node", value: state.selectedNodeId || "" },
           ])}
+        </div>
+      </section>
+
+      <section class="panel danger-zone-panel">
+        <div class="section-head">
+          <div>
+            <h3>Danger Zone</h3>
+            <p>Remove all saved bridge data when you want the console to behave like a fresh install.</p>
+          </div>
+        </div>
+        <div class="danger-zone-card">
+          <div>
+            <strong>Clear Everything</strong>
+            <p>This deletes chat history, events, known nodes, node sightings, snapshots, audit logs, and saved bridge settings. The bridge process keeps running.</p>
+          </div>
+          <button class="action-btn danger-btn" type="button" data-action-click="clear-all-data">Clear Everything</button>
         </div>
       </section>
     </section>
@@ -2451,6 +3358,10 @@ function renderView() {
   }
   if (state.view === "channels") {
     root.innerHTML = renderChannels();
+    return;
+  }
+  if (state.view === "firmware") {
+    root.innerHTML = renderFirmware();
     return;
   }
   if (state.view === "configs") {
@@ -2495,6 +3406,38 @@ async function handleFormSubmit(form) {
   }
 
   try {
+    if (action === "send-chat" || action === "send-node-message") {
+      const text = String(form.elements.text?.value || "").trim();
+      if (!text) {
+        setNotice("Type a message before sending.", "error");
+        return;
+      }
+      const channel = Number.parseInt(String(form.elements.channel?.value || "0"), 10) || 0;
+      const destination = action === "send-node-message" ? String(form.elements.destination?.value || "").trim() : "broadcast";
+      if (!destination) {
+        setNotice("Select a node before sending a direct message.", "error");
+        return;
+      }
+      const result = await apiFetch("/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, channel, destination }),
+      });
+      form.elements.text.value = "";
+      state.formDirty = false;
+      if (result.message) {
+        mergeMessages([result.message]);
+      }
+      setNotice(action === "send-node-message" ? `Direct message sent on channel ${channel}.` : `Broadcast sent on channel ${channel}.`);
+      if (action === "send-node-message") {
+        await loadNodeHistory(destination);
+        render();
+      } else {
+        renderChatWithScroll({ forceBottom: true });
+      }
+      return;
+    }
+
     if (action === "save-owner") {
       const payload = {
         long_name: form.long_name.value.trim() || null,
@@ -2526,6 +3469,47 @@ async function handleFormSubmit(form) {
       return;
     }
 
+    if (action === "save-lora-settings") {
+      const intValue = (name) => {
+        const parsed = Number.parseInt(String(form.elements[name]?.value || "0"), 10);
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const floatValue = (name) => {
+        const parsed = Number.parseFloat(String(form.elements[name]?.value || "0"));
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const payload = {
+        values: {
+          region: form.elements.region.value,
+          use_preset: form.elements.use_preset.value === "true",
+          modem_preset: form.elements.modem_preset.value,
+          hop_limit: intValue("hop_limit"),
+          channel_num: intValue("channel_num"),
+          tx_enabled: form.elements.tx_enabled.value === "true",
+          tx_power: intValue("tx_power"),
+          sx126x_rx_boosted_gain: form.elements.sx126x_rx_boosted_gain.value === "true",
+          override_frequency: floatValue("override_frequency"),
+          frequency_offset: floatValue("frequency_offset"),
+          bandwidth: intValue("bandwidth"),
+          spread_factor: intValue("spread_factor"),
+          coding_rate: intValue("coding_rate"),
+          override_duty_cycle: form.elements.override_duty_cycle.value === "true",
+          pa_fan_disabled: form.elements.pa_fan_disabled.value === "true",
+          ignore_mqtt: form.elements.ignore_mqtt.value === "true",
+          config_ok_to_mqtt: form.elements.config_ok_to_mqtt.value === "true",
+          ignore_incoming: intListFromText(form.elements.ignore_incoming.value),
+        },
+      };
+      await apiFetch("/config/local/lora", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setNotice("LoRa settings saved.");
+      await loadBootstrap();
+      return;
+    }
+
     if (action === "save-position") {
       const payload = {
         latitude: Number.parseFloat(form.latitude.value),
@@ -2538,6 +3522,34 @@ async function handleFormSubmit(form) {
         body: JSON.stringify(payload),
       });
       setNotice("Fixed position saved.");
+      await loadBootstrap();
+      return;
+    }
+
+    if (action === "save-position-settings") {
+      const intValue = (name) => {
+        const parsed = Number.parseInt(String(form.elements[name]?.value || "0"), 10);
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const payload = {
+        values: {
+          gps_mode: form.elements.gps_mode.value,
+          gps_enabled: form.elements.gps_enabled.value === "true",
+          fixed_position: form.elements.fixed_position.value === "true",
+          position_broadcast_secs: intValue("position_broadcast_secs"),
+          position_broadcast_smart_enabled: form.elements.position_broadcast_smart_enabled.value === "true",
+          gps_update_interval: intValue("gps_update_interval"),
+          gps_attempt_time: intValue("gps_attempt_time"),
+          broadcast_smart_minimum_distance: intValue("broadcast_smart_minimum_distance"),
+          broadcast_smart_minimum_interval_secs: intValue("broadcast_smart_minimum_interval_secs"),
+        },
+      };
+      await apiFetch("/config/local/position", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setNotice("GPS and position settings saved.");
       await loadBootstrap();
       return;
     }
@@ -2611,12 +3623,96 @@ async function handleFormSubmit(form) {
       return;
     }
 
+    if (action === "save-connection-settings") {
+      const nextToken = form.api_token.value.trim();
+      const payload = {
+        device_name: form.device_name.value.trim(),
+        device_address: form.device_address.value.trim(),
+        api_token: nextToken,
+      };
+      const requestAuthToken = String(state.token || "").trim() || nextToken;
+      const requestOptions = {
+        method: "POST",
+        authToken: requestAuthToken,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      };
+      let result;
+      try {
+        result = await apiFetch("/settings", requestOptions);
+      } catch (error) {
+        const canRetryWithTypedToken =
+          nextToken &&
+          nextToken !== requestAuthToken &&
+          String(error?.message || "").toLowerCase().includes("token");
+        if (!canRetryWithTypedToken) {
+          throw error;
+        }
+        result = await apiFetch("/settings", { ...requestOptions, authToken: nextToken });
+      }
+      state.token = nextToken;
+      safeStorageSet("tater_meshtastic_bridge_token", state.token);
+      const restartNeeded = Boolean(result.restart_required);
+      setNotice(restartNeeded ? "Connection settings saved. Restart or reconnect the bridge to use the selected BLE radio." : "Connection settings saved.");
+      await loadBootstrap();
+      return;
+    }
+
+    if (action === "save-runtime-settings") {
+      const hopLimit = form.default_hop_limit.value.trim();
+      const payload = {
+        port: Number.parseInt(form.port.value || "8433", 10) || 8433,
+        reconnect_seconds: Number.parseFloat(form.reconnect_seconds.value || "10") || 10,
+        connect_timeout_seconds: Number.parseInt(form.connect_timeout_seconds.value || "60", 10) || 60,
+        event_buffer_size: Number.parseInt(form.event_buffer_size.value || "500", 10) || 500,
+        log_level: form.log_level.value,
+        include_outbound_events: form.include_outbound_events.value === "true",
+        want_ack: form.want_ack.value === "true",
+        default_hop_limit: hopLimit ? Number.parseInt(hopLimit, 10) : null,
+        no_nodes: form.no_nodes.value === "true",
+        shutdown_timeout_seconds: Number.parseFloat(form.shutdown_timeout_seconds.value || "2") || 2,
+      };
+      const result = await apiFetch("/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const restartNeeded = Boolean(result.restart_required);
+      setNotice(restartNeeded ? "Advanced bridge settings saved. Restart the bridge for startup changes to take effect." : "Advanced bridge settings saved.");
+      await loadBootstrap();
+      return;
+    }
+
+    if (action === "firmware-ota-update") {
+      const filePath = String(form.elements.file_path?.value || "").trim();
+      const tcpHost = String(form.elements.tcp_host?.value || "").trim();
+      const timeoutSeconds = Number.parseInt(String(form.elements.timeout_seconds?.value || "600"), 10) || 600;
+      if (!filePath || !tcpHost) {
+        setNotice("Choose a downloaded firmware file and enter the radio TCP host before starting OTA.", "error");
+        return;
+      }
+      const confirmed = window.confirm(
+        "Start firmware OTA update now? This can take several minutes and should only be used for supported ESP32 WiFi/TCP devices."
+      );
+      if (!confirmed) {
+        return;
+      }
+      const payload = await apiFetch("/firmware/ota-update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_path: filePath, tcp_host: tcpHost, timeout_seconds: timeoutSeconds }),
+      });
+      setNotice(payload.ok ? "Firmware OTA update completed." : "Firmware OTA update finished with warnings.", payload.ok ? "info" : "error");
+      await loadFirmwareStatus({ refresh: true });
+      return;
+    }
+
     if (action === "save-token") {
       state.token = form.token.value.trim();
       state.windowHours = Number.parseInt(form.window_hours.value || "24", 10) || 24;
       safeStorageSet("tater_meshtastic_bridge_token", state.token);
       safeStorageSet("tater_meshtastic_bridge_window_hours", state.windowHours);
-      setNotice("Local console settings saved.");
+      setNotice("Browser access saved.");
       await loadBootstrap();
       return;
     }
@@ -2689,6 +3785,185 @@ async function openChatNodeModal(button) {
   }
 }
 
+function readRuntimeSettingsDraft() {
+  const forms = document.querySelectorAll(
+    'form[data-action="save-token"], form[data-action="save-connection-settings"], form[data-action="save-runtime-settings"]'
+  );
+  if (!forms.length) {
+    return null;
+  }
+  const draft = {};
+  forms.forEach((form) => {
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+    Array.from(form.elements).forEach((element) => {
+      if ((element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement) && element.name) {
+        draft[element.name] = element.value;
+      }
+    });
+  });
+  return draft;
+}
+
+function restoreRuntimeSettingsDraft(draft) {
+  if (!draft || typeof draft !== "object") {
+    return;
+  }
+  const forms = document.querySelectorAll(
+    'form[data-action="save-token"], form[data-action="save-connection-settings"], form[data-action="save-runtime-settings"]'
+  );
+  forms.forEach((form) => {
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+    Object.entries(draft).forEach(([name, value]) => {
+      const element = form.elements.namedItem(name);
+      if (element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement) {
+        element.value = String(value ?? "");
+      }
+    });
+  });
+}
+
+async function runBleScan(button) {
+  const draft = readRuntimeSettingsDraft();
+  state.bleScan = {
+    loading: true,
+    devices: state.bleScan.devices,
+    scannedAt: state.bleScan.scannedAt,
+    error: "",
+  };
+  render();
+  restoreRuntimeSettingsDraft(draft);
+  setNotice("Scanning for Meshtastic BLE devices. This usually takes about 10 seconds.");
+
+  try {
+    const payload = await apiFetch("/ble/scan", { method: "POST" });
+    state.bleScan = {
+      loading: false,
+      devices: Array.isArray(payload.devices) ? payload.devices : [],
+      scannedAt: payload.finished_at || new Date().toISOString(),
+      error: "",
+    };
+    setNotice(`BLE scan complete. Found ${state.bleScan.devices.length} Meshtastic device${state.bleScan.devices.length === 1 ? "" : "s"}.`);
+  } catch (error) {
+    state.bleScan = {
+      loading: false,
+      devices: state.bleScan.devices,
+      scannedAt: state.bleScan.scannedAt,
+      error: error.message || "BLE scan failed.",
+    };
+    setNotice(state.bleScan.error, "error");
+  } finally {
+    render();
+    restoreRuntimeSettingsDraft(draft);
+    if (button instanceof HTMLButtonElement) {
+      button.focus();
+    }
+  }
+}
+
+function selectBleDevice(button) {
+  const name = String(button.dataset.name || "").trim();
+  const address = String(button.dataset.address || "").trim();
+  const nameInput = document.getElementById("runtime-device-name");
+  const addressInput = document.getElementById("runtime-device-address");
+  if (nameInput instanceof HTMLInputElement) {
+    nameInput.value = name;
+  }
+  if (addressInput instanceof HTMLInputElement) {
+    addressInput.value = address;
+  }
+  state.formDirty = true;
+  setNotice("BLE device filled in. Save Connection Settings when you are ready to use it.");
+}
+
+async function loadChannelShare({ refresh = false } = {}) {
+  state.channelShare = {
+    ...state.channelShare,
+    loading: true,
+    error: "",
+  };
+  render();
+  try {
+    const payload = await apiFetch(`/channels/share${refresh ? "?refresh=true" : ""}`);
+    state.channelShare = {
+      loading: false,
+      loaded: true,
+      error: "",
+      shares: Array.isArray(payload.shares) ? payload.shares : [],
+    };
+    setNotice(state.channelShare.shares.length ? "Channel QR codes generated." : "No channel URLs are available to share yet.");
+  } catch (error) {
+    state.channelShare = {
+      ...state.channelShare,
+      loading: false,
+      loaded: true,
+      error: error.message || "Failed to generate channel QR codes.",
+    };
+    setNotice(state.channelShare.error, "error");
+  } finally {
+    render();
+  }
+}
+
+async function loadFirmwareStatus({ refresh = false } = {}) {
+  try {
+    const payload = await apiFetch(`/firmware/status${refresh ? "?refresh=true" : ""}`);
+    state.firmware.status = payload || {};
+    state.firmware.error = "";
+  } catch (error) {
+    state.firmware.error = error.message || "Failed to detect firmware status.";
+    setNotice(state.firmware.error, "error");
+  } finally {
+    render();
+  }
+}
+
+async function loadFirmwareFiles() {
+  state.firmware.loadingFiles = true;
+  render();
+  try {
+    const payload = await apiFetch("/firmware/files");
+    state.firmware.files = Array.isArray(payload.files) ? payload.files : [];
+    state.firmware.error = "";
+  } catch (error) {
+    state.firmware.error = error.message || "Failed to load downloaded firmware files.";
+    setNotice(state.firmware.error, "error");
+  } finally {
+    state.firmware.loadingFiles = false;
+    render();
+  }
+}
+
+async function loadFirmwareReleases() {
+  state.firmware.loadingReleases = true;
+  state.firmware.error = "";
+  render();
+  try {
+    const include = state.firmware.includePrerelease ? "true" : "false";
+    const payload = await apiFetch(`/firmware/releases?include_prerelease=${encodeURIComponent(include)}&limit=8`);
+    state.firmware.releases = Array.isArray(payload.releases) ? payload.releases : [];
+    setNotice(`Loaded ${state.firmware.releases.length} firmware release${state.firmware.releases.length === 1 ? "" : "s"}.`);
+  } catch (error) {
+    state.firmware.error = error.message || "Failed to load firmware releases.";
+    setNotice(state.firmware.error, "error");
+  } finally {
+    state.firmware.loadingReleases = false;
+    render();
+  }
+}
+
+async function ensureFirmwareLoaded() {
+  if (!state.firmware.status) {
+    await loadFirmwareStatus();
+  }
+  if (!state.firmware.files.length) {
+    await loadFirmwareFiles();
+  }
+}
+
 async function handleActionClick(button) {
   const action = String(button?.dataset?.actionClick || "").trim();
   if (!action) {
@@ -2706,6 +3981,135 @@ async function handleActionClick(button) {
 
     if (action === "close-node-modal") {
       closeNodeModal();
+      return;
+    }
+
+    if (action === "ble-scan") {
+      await runBleScan(button);
+      return;
+    }
+
+    if (action === "select-ble-device") {
+      selectBleDevice(button);
+      return;
+    }
+
+    if (action === "clear-api-token-local") {
+      const confirmed = window.confirm(
+        "Clear the Bridge API Token now? This only works from the bridge host itself, and it will leave the bridge API/UI unlocked until you save a new token."
+      );
+      if (!confirmed) {
+        return;
+      }
+      await apiFetch("/auth/clear-token", { method: "POST", authToken: "" });
+      state.token = "";
+      safeStorageSet("tater_meshtastic_bridge_token", state.token);
+      setNotice("Bridge API token cleared. You can now save connection settings or set a fresh token.");
+      await loadBootstrap();
+      return;
+    }
+
+    if (action === "load-channel-share") {
+      await loadChannelShare({ refresh: true });
+      return;
+    }
+
+    if (action === "firmware-refresh-status") {
+      await loadFirmwareStatus({ refresh: true });
+      return;
+    }
+
+    if (action === "firmware-refresh-files") {
+      await loadFirmwareFiles();
+      return;
+    }
+
+    if (action === "firmware-load-releases") {
+      await loadFirmwareReleases();
+      return;
+    }
+
+    if (action === "firmware-prerelease-toggle") {
+      state.firmware.includePrerelease = !state.firmware.includePrerelease;
+      safeStorageSet("tater_meshtastic_bridge_firmware_prerelease", state.firmware.includePrerelease ? "true" : "false");
+      await loadFirmwareReleases();
+      return;
+    }
+
+    if (action === "firmware-download") {
+      const assetName = String(button.dataset.assetName || "").trim();
+      const assetUrl = String(button.dataset.assetUrl || "").trim();
+      const tagName = String(button.dataset.tagName || "").trim();
+      const confirmed = window.confirm(`Download firmware asset '${assetName}' into the bridge cache?`);
+      if (!confirmed) {
+        return;
+      }
+      await apiFetch("/firmware/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ asset_name: assetName, asset_url: assetUrl, tag_name: tagName }),
+      });
+      setNotice(`Downloaded ${assetName}.`);
+      await loadFirmwareFiles();
+      return;
+    }
+
+    if (action === "firmware-device-action") {
+      const kind = String(button.dataset.deviceAction || "").trim();
+      const confirmed = window.confirm(`Send '${kind}' to the connected radio? This may disconnect Bluetooth and put the device into update mode.`);
+      if (!confirmed) {
+        return;
+      }
+      await apiFetch(`/device/action/${encodeURIComponent(kind)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seconds: 10 }),
+      });
+      setNotice(`Firmware prep action '${kind}' sent.`);
+      await loadBootstrap();
+      return;
+    }
+
+    if (action === "clear-runtime-settings") {
+      const confirmed = window.confirm(
+        "Clear all saved bridge runtime settings? This resets the BLE target, API token, reconnect options, and UI-managed port back to defaults. Message and node history will be kept."
+      );
+      if (!confirmed) {
+        return;
+      }
+      const result = await apiFetch("/settings", { method: "DELETE" });
+      state.token = "";
+      safeStorageSet("tater_meshtastic_bridge_token", state.token);
+      state.bleScan = { loading: false, devices: null, scannedAt: "", error: "" };
+      const restartNeeded = Boolean(result.restart_required);
+      setNotice(restartNeeded ? "Saved bridge settings cleared. Restart the bridge before connecting to a new device." : "Saved bridge settings cleared.");
+      await loadBootstrap();
+      return;
+    }
+
+    if (action === "clear-all-data") {
+      const confirmed = window.confirm(
+        "Clear EVERYTHING from the bridge database? This deletes chat/messages, events, known nodes, snapshots, audit logs, and saved settings. This cannot be undone."
+      );
+      if (!confirmed) {
+        return;
+      }
+      const typed = window.prompt("Type CLEAR to permanently delete all bridge data.");
+      if (String(typed || "").trim() !== "CLEAR") {
+        setNotice("Clear everything cancelled.");
+        return;
+      }
+      const result = await apiFetch("/data", { method: "DELETE" });
+      state.token = "";
+      safeStorageSet("tater_meshtastic_bridge_token", state.token);
+      state.bleScan = { loading: false, devices: null, scannedAt: "", error: "" };
+      state.channelShare = { loading: false, loaded: false, error: "", shares: [] };
+      state.selectedNodeId = "";
+      state.nodeHistory = [];
+      state.latestMessageEventId = 0;
+      const restartNeeded = Boolean(result.restart_required);
+      setNotice(restartNeeded ? "All bridge data cleared. Restart the bridge before connecting to a new device." : "All bridge data cleared.");
+      await loadBootstrap();
       return;
     }
 
@@ -2816,6 +4220,9 @@ function installEventHandlers() {
       render();
       if (state.view === "chat") {
         stickCurrentChatToBottom();
+      }
+      if (state.view === "firmware") {
+        await ensureFirmwareLoaded();
       }
     });
   });
@@ -2944,6 +4351,7 @@ function installEventHandlers() {
 
     root.addEventListener("input", handleConfigDraftInput);
     root.addEventListener("change", handleConfigDraftInput);
+    root.addEventListener("keydown", handleChatComposerKeydown);
   }
 
   const modalRoot = document.getElementById("modal-root");

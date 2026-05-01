@@ -1,16 +1,34 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+import re
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from google.protobuf.json_format import MessageToDict, ParseDict
 
-from .config import Settings
+from .config import (
+    BRIDGE_SETTING_KEYS,
+    DEFAULT_BRIDGE_SETTINGS,
+    DEFAULT_BRIDGE_PORT,
+    RESTART_REQUIRED_SETTINGS,
+    Settings,
+    _coerce_bool,
+    _coerce_float,
+    _coerce_int,
+    _coerce_optional_int,
+    _normalize_log_level,
+)
 from .database import BridgeDatabase
 from .store import EventBuffer
 
@@ -67,6 +85,27 @@ def _plain_data(value: Any, depth: int = 3) -> Any:
     return repr(value)
 
 
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _slugify_firmware_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    token = token.replace("+", "-plus").replace(".", "-").replace("_", "-")
+    token = re.sub(r"[^a-z0-9]+", "-", token)
+    return token.strip("-")
+
+
+def _safe_filename(value: Any, fallback: str = "firmware.bin") -> str:
+    name = Path(str(value or fallback)).name
+    name = re.sub(r"[^A-Za-z0-9._+-]+", "_", name).strip("._")
+    return name or fallback
+
+
 def _proto_to_dict(message: Any) -> Dict[str, Any]:
     try:
         return MessageToDict(
@@ -115,6 +154,10 @@ def _enum_default_name(field: FieldDescriptor) -> str:
         return str(field.enum_type.values[0].name)
     except Exception:
         return ""
+
+
+def _compact_exception_message(exc: Exception) -> str:
+    return " ".join(str(exc or exc.__class__.__name__).split())
 
 
 def _proto_default_value(field: FieldDescriptor, *, repeated: Optional[bool] = None) -> Any:
@@ -306,11 +349,13 @@ class MeshtasticBridgeService:
         self.local_short_name = ""
         self.local_node_num = 0
         self.device_name = settings.device_name or settings.device_address or "Meshtastic"
+        self._desired_port = int(settings.port)
         self.database = BridgeDatabase(settings.database_path)
         self.events = EventBuffer(settings.event_buffer_size, next_id=self.database.next_event_id())
 
         self._lock = Lock()
         self._radio_lock = RLock()
+        self._ble_scan_lock = Lock()
         self._stop_event = Event()
         self._disconnect_event = Event()
         self._worker: Optional[Thread] = None
@@ -502,6 +547,46 @@ class MeshtasticBridgeService:
             urls["all"] = ""
         return urls
 
+    def _qr_svg_for_text(self, text: str) -> str:
+        try:
+            pyqrcode = importlib.import_module("pyqrcode")
+        except Exception as exc:
+            raise RuntimeError("QR generation needs pyqrcode. Reinstall the bridge package to install the latest dependencies.") from exc
+
+        qr = pyqrcode.create(str(text or "").strip(), error="M")
+        svg = qr.svg_as_string(scale=5, xmldecl=False, svgns=True)
+        if isinstance(svg, bytes):
+            return svg.decode("utf-8", errors="replace")
+        return str(svg or "")
+
+    def channel_share_snapshot(self, *, refresh: bool = False) -> Dict[str, Any]:
+        if refresh:
+            self.snapshot_state()
+        urls = self.channel_urls()
+        shares: List[Dict[str, str]] = []
+        for key, label, description in (
+            ("primary", "Primary Channel", "Share only the primary channel information."),
+            ("all", "All Channels", "Share the complete channel set from this radio."),
+        ):
+            url = str(urls.get(key) or "").strip()
+            if not url:
+                continue
+            shares.append(
+                {
+                    "kind": key,
+                    "label": label,
+                    "description": description,
+                    "url": url,
+                    "svg": self._qr_svg_for_text(url),
+                }
+            )
+        return {
+            "ok": True,
+            "urls": urls,
+            "shares": shares,
+            "count": len(shares),
+        }
+
     def config_snapshot(self, *, refresh: bool = False) -> Dict[str, Any]:
         if refresh:
             self.snapshot_state()
@@ -521,6 +606,264 @@ class MeshtasticBridgeService:
             return payload
         snapshots = self.snapshot_state()
         return snapshots.get("device") or {}
+
+    def firmware_status(self, *, refresh: bool = False) -> Dict[str, Any]:
+        device = self.device_snapshot(refresh=refresh)
+        metadata = dict(device.get("metadata") or {}) if isinstance(device.get("metadata"), dict) else {}
+        my_info = dict(device.get("my_info") or {}) if isinstance(device.get("my_info"), dict) else {}
+        node_info = dict(device.get("node_info") or {}) if isinstance(device.get("node_info"), dict) else {}
+        user = dict(node_info.get("user") or {}) if isinstance(node_info.get("user"), dict) else {}
+
+        hardware_model = _first_text(
+            metadata.get("hw_model"),
+            metadata.get("hwModel"),
+            metadata.get("hardware_model"),
+            metadata.get("hardwareModel"),
+            my_info.get("hw_model"),
+            my_info.get("hwModel"),
+            user.get("hw_model"),
+            user.get("hwModel"),
+        )
+        firmware_version = _first_text(
+            metadata.get("firmware_version"),
+            metadata.get("firmwareVersion"),
+            metadata.get("sw_version"),
+            metadata.get("swVersion"),
+            my_info.get("firmware_version"),
+            my_info.get("firmwareVersion"),
+        )
+        device_role = _first_text(metadata.get("role"), my_info.get("role"), user.get("role"))
+        candidates = self._firmware_target_candidates(hardware_model)
+        return {
+            "ok": True,
+            "connected": bool(device.get("connected")),
+            "transport": self.transport,
+            "firmware_version": firmware_version,
+            "hardware_model": hardware_model,
+            "device_role": device_role,
+            "target_candidates": candidates,
+            "cache_dir": str(self._firmware_cache_dir()),
+            "device": device,
+            "notes": [
+                "BLE can detect the radio and put some boards into DFU/OTA mode.",
+                "ESP32 OTA flashing requires WiFi/TCP and firmware support.",
+                "USB/Web Serial or drag-and-drop flashing is still recommended for full erase or bootloader recovery.",
+            ],
+        }
+
+    def firmware_releases(self, *, include_prerelease: bool = False, limit: int = 8) -> Dict[str, Any]:
+        releases = self._github_releases(limit=max(1, min(int(limit or 8), 30)))
+        status = self.firmware_status(refresh=False)
+        candidates = list(status.get("target_candidates") or [])
+        rows: List[Dict[str, Any]] = []
+        for release in releases:
+            if release.get("draft"):
+                continue
+            if release.get("prerelease") and not include_prerelease:
+                continue
+            assets = [self._normalize_firmware_asset(asset, candidates) for asset in release.get("assets") or []]
+            assets = [asset for asset in assets if asset.get("firmware_like")]
+            rows.append(
+                {
+                    "id": release.get("id"),
+                    "name": release.get("name") or release.get("tag_name"),
+                    "tag_name": release.get("tag_name"),
+                    "published_at": release.get("published_at"),
+                    "prerelease": bool(release.get("prerelease")),
+                    "html_url": release.get("html_url"),
+                    "assets": sorted(assets, key=lambda item: (-int(item.get("match_score") or 0), str(item.get("name") or ""))),
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return {
+            "ok": True,
+            "source": "https://api.github.com/repos/meshtastic/firmware/releases",
+            "target_candidates": candidates,
+            "releases": rows,
+            "count": len(rows),
+        }
+
+    def list_firmware_files(self) -> Dict[str, Any]:
+        cache_dir = self._firmware_cache_dir()
+        files: List[Dict[str, Any]] = []
+        if cache_dir.exists():
+            for path in sorted(cache_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+                files.append(
+                    {
+                        "name": path.name,
+                        "path": str(path),
+                        "tag_name": path.parent.name if path.parent != cache_dir else "",
+                        "size": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                    }
+                )
+        return {"ok": True, "cache_dir": str(cache_dir), "files": files, "count": len(files)}
+
+    def download_firmware_asset(self, *, asset_url: str, asset_name: str, tag_name: str = "") -> Dict[str, Any]:
+        url = str(asset_url or "").strip()
+        if not url.startswith("https://github.com/meshtastic/firmware/releases/download/"):
+            raise ValueError("Firmware asset URL must be from meshtastic/firmware GitHub releases.")
+        safe_name = _safe_filename(asset_name)
+        safe_tag = _safe_filename(tag_name or "download", fallback="download")
+        target_dir = self._firmware_cache_dir() / safe_tag
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / safe_name
+        request = Request(url, headers={"User-Agent": "tater-meshtastic-bridge"})
+        try:
+            with urlopen(request, timeout=60) as response, target_path.open("wb") as out:
+                while True:
+                    chunk = response.read(1024 * 512)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise RuntimeError(f"Firmware download failed: {exc}") from exc
+        stat = target_path.stat()
+        payload = {
+            "ok": True,
+            "file": {
+                "name": target_path.name,
+                "path": str(target_path),
+                "tag_name": safe_tag,
+                "size": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            },
+        }
+        self.database.record_audit(timestamp=_utc_now_iso(), action="download_firmware", target=target_path.name, status="ok", details=payload)
+        return payload
+
+    def ota_update_firmware(self, *, file_path: str, tcp_host: str, timeout_seconds: int = 600) -> Dict[str, Any]:
+        host = str(tcp_host or "").strip()
+        if not host:
+            raise ValueError("A Meshtastic WiFi/TCP host is required for OTA firmware update.")
+        path = Path(str(file_path or "")).expanduser().resolve()
+        cache_dir = self._firmware_cache_dir().resolve()
+        try:
+            path.relative_to(cache_dir)
+        except ValueError as exc:
+            raise ValueError("Firmware OTA can only use files downloaded into the bridge firmware cache.") from exc
+        if not path.exists() or not path.is_file():
+            raise ValueError("Firmware file does not exist.")
+        wait = max(60, min(int(timeout_seconds or 600), 1800))
+        command = [
+            sys.executable,
+            "-m",
+            "meshtastic",
+            "--host",
+            host,
+            "--ota-update",
+            str(path),
+            "--timeout",
+            str(wait),
+            "--no-nodes",
+        ]
+        timestamp = _utc_now_iso()
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=wait + 30)
+        except subprocess.TimeoutExpired as exc:
+            self.database.record_audit(
+                timestamp=timestamp,
+                action="ota_update_firmware",
+                target=host,
+                status="error",
+                details={"file": str(path), "error": "Timed out waiting for OTA update to finish."},
+            )
+            raise RuntimeError("Timed out waiting for OTA update to finish.") from exc
+        payload = {
+            "ok": result.returncode == 0,
+            "host": host,
+            "file": str(path),
+            "returncode": result.returncode,
+            "stdout": (result.stdout or "")[-6000:],
+            "stderr": (result.stderr or "")[-6000:],
+        }
+        self.database.record_audit(
+            timestamp=timestamp,
+            action="ota_update_firmware",
+            target=host,
+            status="ok" if result.returncode == 0 else "error",
+            details=payload,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(payload["stderr"] or payload["stdout"] or f"OTA update failed with exit code {result.returncode}.")
+        return payload
+
+    def _firmware_cache_dir(self) -> Path:
+        return Path(self.settings.database_path).expanduser().resolve().parent / "firmware"
+
+    def _github_releases(self, *, limit: int = 8) -> List[Dict[str, Any]]:
+        per_page = max(1, min(int(limit or 8) * 3, 50))
+        url = f"https://api.github.com/repos/meshtastic/firmware/releases?per_page={per_page}"
+        request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "tater-meshtastic-bridge"})
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Unable to fetch Meshtastic firmware releases: {exc}") from exc
+        return payload if isinstance(payload, list) else []
+
+    def _firmware_target_candidates(self, hardware_model: str) -> List[str]:
+        base = _slugify_firmware_token(hardware_model)
+        candidates = [base] if base else []
+        aliases = {
+            "thinknode-m6": ["thinknode-m6"],
+            "thinknode-m5": ["thinknode-m5"],
+            "thinknode-m4": ["thinknode-m4"],
+            "heltec-v3": ["heltec-v3"],
+            "heltec-v4": ["heltec-v4"],
+            "heltec-mesh-node-t114": ["heltec-mesh-node-t114", "t114"],
+            "heltec-wireless-tracker": ["heltec-wireless-tracker"],
+            "heltec-wireless-tracker-v2": ["heltec-wireless-tracker-v2"],
+            "t-deck": ["t-deck"],
+            "t-deck-pro": ["t-deck-pro"],
+            "t-echo": ["t-echo", "techo"],
+            "t-echo-lite": ["t-echo-lite"],
+            "rak4631": ["rak4631"],
+            "rak11200": ["rak11200"],
+            "seeed-xiao-s3": ["seeed-xiao-esp32s3", "seeed-xiao-s3"],
+            "tracker-t1000-e": ["t1000-e", "tracker-t1000-e"],
+            "tbeam": ["tbeam"],
+            "lilygo-tbeam-s3-core": ["tbeam-s3-core", "lilygo-tbeam-s3-core"],
+        }
+        for key, values in aliases.items():
+            if base == key or base.endswith(key):
+                candidates.extend(values)
+        for candidate in list(candidates):
+            if candidate.startswith("hardware-model-"):
+                candidates.append(candidate.removeprefix("hardware-model-"))
+        deduped: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
+
+    def _normalize_firmware_asset(self, asset: Dict[str, Any], candidates: List[str]) -> Dict[str, Any]:
+        name = str(asset.get("name") or "").strip()
+        lowered = name.lower()
+        firmware_like = lowered.endswith((".zip", ".bin", ".uf2", ".hex")) or "firmware" in lowered
+        score = 0
+        for candidate in candidates:
+            if candidate and candidate in lowered:
+                score += 10
+        if lowered.endswith(".zip"):
+            score += 2
+        if "update" in lowered or "ota" in lowered:
+            score += 1
+        return {
+            "id": asset.get("id"),
+            "name": name,
+            "size": asset.get("size") or 0,
+            "download_count": asset.get("download_count") or 0,
+            "content_type": asset.get("content_type") or "",
+            "browser_download_url": asset.get("browser_download_url") or "",
+            "updated_at": asset.get("updated_at") or asset.get("created_at") or "",
+            "firmware_like": firmware_like,
+            "match_score": score,
+        }
 
     def snapshot_state(self) -> Dict[str, Any]:
         timestamp = _utc_now_iso()
@@ -583,6 +926,265 @@ class MeshtasticBridgeService:
 
     def list_audit_log(self, *, limit: int = 100) -> List[Dict[str, Any]]:
         return self.database.list_audit(limit=limit)
+
+    def _runtime_settings_values(self, *, desired: bool = True) -> Dict[str, Any]:
+        return {
+            "host": self.settings.host,
+            "port": int(self._desired_port if desired else self.settings.port),
+            "database_path": self.settings.database_path,
+            "device_name": self.settings.device_name,
+            "device_address": self.settings.device_address,
+            "api_token": self.settings.api_token,
+            "reconnect_seconds": float(self.settings.reconnect_seconds),
+            "connect_timeout_seconds": int(self.settings.connect_timeout_seconds),
+            "event_buffer_size": int(self.settings.event_buffer_size),
+            "log_level": self.settings.log_level,
+            "include_outbound_events": bool(self.settings.include_outbound_events),
+            "want_ack": bool(self.settings.want_ack),
+            "default_hop_limit": self.settings.default_hop_limit,
+            "no_nodes": bool(self.settings.no_nodes),
+            "shutdown_timeout_seconds": float(self.settings.shutdown_timeout_seconds),
+        }
+
+    def _normalize_runtime_settings(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        current = self._runtime_settings_values(desired=True)
+        raw = dict(values or {})
+        return {
+            "port": _coerce_int(raw.get("port", current["port"]), int(current["port"] or DEFAULT_BRIDGE_PORT), minimum=1, maximum=65535),
+            "device_name": str(raw.get("device_name", current["device_name"]) or "").strip(),
+            "device_address": str(raw.get("device_address", current["device_address"]) or "").strip(),
+            "api_token": str(raw.get("api_token", current["api_token"]) or "").strip(),
+            "reconnect_seconds": _coerce_float(raw.get("reconnect_seconds", current["reconnect_seconds"]), float(current["reconnect_seconds"] or 10.0), minimum=1.0),
+            "connect_timeout_seconds": _coerce_int(raw.get("connect_timeout_seconds", current["connect_timeout_seconds"]), int(current["connect_timeout_seconds"] or 60), minimum=5),
+            "event_buffer_size": _coerce_int(raw.get("event_buffer_size", current["event_buffer_size"]), int(current["event_buffer_size"] or 500), minimum=50),
+            "log_level": _normalize_log_level(raw.get("log_level", current["log_level"])),
+            "include_outbound_events": _coerce_bool(raw.get("include_outbound_events", current["include_outbound_events"]), bool(current["include_outbound_events"])),
+            "want_ack": _coerce_bool(raw.get("want_ack", current["want_ack"]), bool(current["want_ack"])),
+            "default_hop_limit": _coerce_optional_int(raw.get("default_hop_limit", current["default_hop_limit"])),
+            "no_nodes": _coerce_bool(raw.get("no_nodes", current["no_nodes"]), bool(current["no_nodes"])),
+            "shutdown_timeout_seconds": _coerce_float(
+                raw.get("shutdown_timeout_seconds", current["shutdown_timeout_seconds"]),
+                float(current["shutdown_timeout_seconds"] or 2.0),
+                minimum=0.1,
+            ),
+        }
+
+    def runtime_settings_snapshot(self) -> Dict[str, Any]:
+        saved = self.database.get_bridge_settings()
+        sources = dict(self.settings.settings_sources or {})
+        values = self._runtime_settings_values(desired=True)
+        active = self._runtime_settings_values(desired=False)
+
+        if sources.get("port") != "env" and "port" in saved:
+            values["port"] = _coerce_int(saved.get("port"), int(values.get("port") or DEFAULT_BRIDGE_PORT), minimum=1, maximum=65535)
+        for key in BRIDGE_SETTING_KEYS:
+            if key in saved and sources.get(key) != "env" and key != "port":
+                values[key] = self._normalize_runtime_settings({key: saved.get(key)}).get(key, values.get(key))
+
+        return {
+            "ok": True,
+            "values": values,
+            "active": active,
+            "sources": sources,
+            "env_overrides": {
+                "port": sources.get("port") == "env",
+                "database_path": sources.get("database_path") == "env",
+            },
+            "restart_required_keys": sorted(RESTART_REQUIRED_SETTINGS),
+            "restart_required": values.get("port") != active.get("port"),
+            "notes": {
+                "host": "The bridge always binds to 0.0.0.0 so other machines on the LAN can reach it.",
+                "port": "MESHTASTIC_BRIDGE_PORT is only treated as a hard override when it is set to a non-default port.",
+                "database_path": "The database path is a startup-only setting and still comes from MESHTASTIC_DATABASE_PATH or the platform default.",
+            },
+        }
+
+    def update_runtime_settings(self, *, values: Dict[str, Any]) -> Dict[str, Any]:
+        before = self.runtime_settings_snapshot()
+        normalized = self._normalize_runtime_settings(values)
+        sources = dict(self.settings.settings_sources or {})
+
+        if sources.get("port") == "env":
+            normalized["port"] = int(before.get("values", {}).get("port") or self.settings.port)
+
+        timestamp = _utc_now_iso()
+        self.database.save_bridge_settings(normalized, timestamp=timestamp)
+
+        self._desired_port = int(normalized["port"])
+        for key, value in normalized.items():
+            if key == "port":
+                sources[key] = "env" if sources.get("port") == "env" else "ui"
+                continue
+            if hasattr(self.settings, key):
+                setattr(self.settings, key, value)
+                sources[key] = "ui"
+
+        self.settings.settings_sources = sources
+        self.device_name = self.local_long_name or self.settings.device_name or self.settings.device_address or "Meshtastic"
+        logging.getLogger().setLevel(getattr(logging, str(self.settings.log_level or "INFO").upper(), logging.INFO))
+        logger.setLevel(getattr(logging, str(self.settings.log_level or "INFO").upper(), logging.INFO))
+
+        after = self.runtime_settings_snapshot()
+        changed = [
+            key
+            for key in sorted(set((before.get("values") or {}).keys()) | set((after.get("values") or {}).keys()))
+            if (before.get("values") or {}).get(key) != (after.get("values") or {}).get(key)
+        ]
+        restart_keys = sorted(key for key in changed if key in RESTART_REQUIRED_SETTINGS)
+        after["changed_keys"] = changed
+        after["restart_required_keys"] = sorted(set(after.get("restart_required_keys") or []) | set(restart_keys))
+        after["restart_required"] = bool(restart_keys or after.get("restart_required"))
+
+        self.database.record_audit(
+            timestamp=timestamp,
+            action="update_bridge_settings",
+            target="bridge",
+            status="ok",
+            details={
+                "changed_keys": changed,
+                "restart_required_keys": restart_keys,
+                "env_overrides": after.get("env_overrides") or {},
+            },
+        )
+        return after
+
+    def clear_runtime_settings(self) -> Dict[str, Any]:
+        before = self.runtime_settings_snapshot()
+        previous_saved = self.database.clear_bridge_settings()
+        sources = dict(self.settings.settings_sources or {})
+        normalized = self._normalize_runtime_settings(dict(DEFAULT_BRIDGE_SETTINGS))
+
+        if sources.get("port") == "env":
+            normalized["port"] = int(before.get("values", {}).get("port") or self.settings.port)
+
+        self._desired_port = int(normalized["port"])
+        for key, value in normalized.items():
+            if key == "port":
+                sources[key] = "env" if sources.get("port") == "env" else "default"
+                continue
+            if hasattr(self.settings, key):
+                setattr(self.settings, key, value)
+                sources[key] = "default"
+
+        sources["host"] = "fixed"
+        sources["database_path"] = sources.get("database_path") or "default"
+        self.settings.settings_sources = sources
+        self.device_name = self.local_long_name or self.settings.device_name or self.settings.device_address or "Meshtastic"
+        logging.getLogger().setLevel(getattr(logging, str(self.settings.log_level or "INFO").upper(), logging.INFO))
+        logger.setLevel(getattr(logging, str(self.settings.log_level or "INFO").upper(), logging.INFO))
+
+        after = self.runtime_settings_snapshot()
+        changed = [
+            key
+            for key in sorted(set((before.get("values") or {}).keys()) | set((after.get("values") or {}).keys()))
+            if (before.get("values") or {}).get(key) != (after.get("values") or {}).get(key)
+        ]
+        restart_keys = sorted(key for key in changed if key in RESTART_REQUIRED_SETTINGS)
+        after["changed_keys"] = changed
+        after["restart_required_keys"] = sorted(set(after.get("restart_required_keys") or []) | set(restart_keys))
+        after["restart_required"] = bool(restart_keys or after.get("restart_required"))
+        after["cleared_settings"] = previous_saved
+
+        self.database.record_audit(
+            timestamp=_utc_now_iso(),
+            action="clear_bridge_settings",
+            target="bridge",
+            status="ok",
+            details={
+                "changed_keys": changed,
+                "restart_required_keys": restart_keys,
+                "cleared_settings": previous_saved,
+            },
+        )
+        return after
+
+    def _apply_default_runtime_settings(self, *, before: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        before = before or self.runtime_settings_snapshot()
+        sources = dict(self.settings.settings_sources or {})
+        normalized = self._normalize_runtime_settings(dict(DEFAULT_BRIDGE_SETTINGS))
+
+        if sources.get("port") == "env":
+            normalized["port"] = int(before.get("values", {}).get("port") or self.settings.port)
+
+        self._desired_port = int(normalized["port"])
+        for key, value in normalized.items():
+            if key == "port":
+                sources[key] = "env" if sources.get("port") == "env" else "default"
+                continue
+            if hasattr(self.settings, key):
+                setattr(self.settings, key, value)
+                sources[key] = "default"
+
+        sources["host"] = "fixed"
+        sources["database_path"] = sources.get("database_path") or "default"
+        self.settings.settings_sources = sources
+        self.device_name = self.local_long_name or self.settings.device_name or self.settings.device_address or "Meshtastic"
+        logging.getLogger().setLevel(getattr(logging, str(self.settings.log_level or "INFO").upper(), logging.INFO))
+        logger.setLevel(getattr(logging, str(self.settings.log_level or "INFO").upper(), logging.INFO))
+        return normalized
+
+    def clear_all_data(self) -> Dict[str, Any]:
+        before = self.runtime_settings_snapshot()
+        cleared = self.database.clear_all_data()
+        self.events.clear(next_id=1)
+        self._snapshot_cache = {}
+        self._apply_default_runtime_settings(before=before)
+        after = self.runtime_settings_snapshot()
+        changed = [
+            key
+            for key in sorted(set((before.get("values") or {}).keys()) | set((after.get("values") or {}).keys()))
+            if (before.get("values") or {}).get(key) != (after.get("values") or {}).get(key)
+        ]
+        restart_keys = sorted(key for key in changed if key in RESTART_REQUIRED_SETTINGS)
+        after["changed_keys"] = changed
+        after["restart_required_keys"] = sorted(set(after.get("restart_required_keys") or []) | set(restart_keys))
+        after["restart_required"] = bool(restart_keys or after.get("restart_required"))
+        after["cleared"] = cleared
+        logger.warning("Cleared all Meshtastic bridge data and saved settings")
+        return after
+
+    def scan_ble_devices(self) -> Dict[str, Any]:
+        if not self._ble_scan_lock.acquire(blocking=False):
+            raise RuntimeError("A BLE scan is already running.")
+
+        started_at = _utc_now_iso()
+        try:
+            ble_module = importlib.import_module("meshtastic.ble_interface")
+            interface_cls = getattr(ble_module, "BLEInterface")
+            logger.info("Scanning for Meshtastic BLE devices from bridge API")
+            devices = interface_cls.scan()
+            configured_name = str(self.settings.device_name or "").strip()
+            configured_address = str(self.settings.device_address or "").strip()
+            normalized: List[Dict[str, Any]] = []
+            for index, device in enumerate(devices):
+                name = str(getattr(device, "name", "") or "").strip()
+                address = str(getattr(device, "address", "") or "").strip()
+                rssi = getattr(device, "rssi", None)
+                normalized.append(
+                    {
+                        "index": index,
+                        "name": name,
+                        "address": address,
+                        "identifier": address or name,
+                        "rssi": rssi if isinstance(rssi, (int, float)) else None,
+                        "matches_config": bool((configured_address and address == configured_address) or (configured_name and name == configured_name)),
+                    }
+                )
+            return {
+                "ok": True,
+                "transport": "ble",
+                "started_at": started_at,
+                "finished_at": _utc_now_iso(),
+                "devices": normalized,
+                "count": len(normalized),
+            }
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.warning("Meshtastic BLE scan failed: %s", exc)
+            raise RuntimeError(f"BLE scan failed: {exc}") from exc
+        finally:
+            self._ble_scan_lock.release()
 
     def send_text(self, *, text: str, channel: int = 0, destination: str = "broadcast") -> Dict[str, Any]:
         body = str(text or "").strip()
@@ -903,8 +1505,10 @@ class MeshtasticBridgeService:
                     if self._disconnect_event.wait(0.5):
                         break
             except Exception as exc:
-                logger.exception("Meshtastic bridge connection loop failed")
-                self._set_state(connected=False, state="reconnecting", error=str(exc))
+                friendly_error = self._friendly_connection_error(exc)
+                logger.warning("Meshtastic BLE connection failed: %s", friendly_error)
+                logger.debug("Meshtastic bridge connection loop failed", exc_info=True)
+                self._set_state(connected=False, state="reconnecting", error=friendly_error)
             finally:
                 self._close_interface()
                 if self._stop_event.is_set():
@@ -914,6 +1518,39 @@ class MeshtasticBridgeService:
                 delay = self.settings.reconnect_seconds * min(6, max(1, self.reconnect_attempt))
                 if self._stop_event.wait(delay):
                     break
+
+    def _friendly_connection_error(self, exc: Exception) -> str:
+        raw = _compact_exception_message(exc)
+        lowered = raw.lower()
+        identifier = self.settings.device_identifier or "the configured Meshtastic device"
+
+        if "peer removed pairing information" in lowered:
+            return (
+                "Bluetooth pairing is stale for "
+                f"{identifier}. macOS says the radio removed pairing information. "
+                "Forget/remove this device in macOS Bluetooth settings, restart the radio, then use Settings -> Scan for Devices and save the fresh address."
+            )
+        if "no meshtastic ble peripheral" in lowered or "no device found" in lowered:
+            return (
+                f"No Meshtastic BLE device was found for {identifier}. "
+                "Use Settings -> Scan for Devices and save the current name or address."
+            )
+        if "more than one meshtastic ble peripheral" in lowered:
+            return (
+                f"More than one Meshtastic BLE device matched {identifier}. "
+                "Use Settings -> Scan for Devices and save the exact BLE address instead of the name."
+            )
+        if "failed to connect" in lowered or "connection failed" in lowered or "esp_err_http_connect" in lowered:
+            return (
+                f"Could not connect to {identifier}. "
+                "Make sure the radio is nearby, powered on, not already connected to another app, and re-scan if the address changed."
+            )
+        if "timed out" in lowered or "timeout" in lowered:
+            return (
+                f"Timed out connecting to {identifier}. "
+                "Move the radio closer, wake/restart it, then scan again if needed."
+            )
+        return raw or exc.__class__.__name__
 
     def _connect_once(self) -> None:
         meshtastic_module, pub = self._load_meshtastic_dependencies()

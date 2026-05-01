@@ -116,6 +116,12 @@ class BridgeDatabase:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC);
+
+                CREATE TABLE IF NOT EXISTS bridge_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -428,6 +434,54 @@ class BridgeDatabase:
             }
             for row in rows
         ]
+
+    def get_bridge_settings(self) -> Dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT key, value_json FROM bridge_settings ORDER BY key ASC").fetchall()
+        return {str(row["key"] or ""): _json_load(row["value_json"], None) for row in rows if str(row["key"] or "").strip()}
+
+    def save_bridge_settings(self, values: Dict[str, Any], *, timestamp: str) -> None:
+        payload = dict(values or {})
+        with self._lock, self._connect() as conn:
+            for key, value in payload.items():
+                token = str(key or "").strip()
+                if not token:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO bridge_settings (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json=excluded.value_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (token, json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True), timestamp),
+                )
+
+    def clear_bridge_settings(self) -> int:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM bridge_settings")
+            return int(cursor.rowcount or 0)
+
+    def clear_all_data(self) -> Dict[str, int]:
+        tables = (
+            "events",
+            "node_registry",
+            "node_sightings",
+            "snapshots",
+            "snapshot_history",
+            "audit_log",
+            "bridge_settings",
+        )
+        cleared: Dict[str, int] = {}
+        with self._lock, self._connect() as conn:
+            for table in tables:
+                cursor = conn.execute(f"DELETE FROM {table}")
+                cleared[table] = int(cursor.rowcount or 0)
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('node_sightings', 'snapshot_history', 'audit_log')"
+            )
+        return cleared
 
     def stats_summary(self, *, window_hours: int = 24) -> Dict[str, Any]:
         hours = max(1, int(window_hours))

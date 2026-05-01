@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tater-meshtastic-bridge"
-version = "0.2.0"
+version = "0.2.12"
 description = "Host-side BLE bridge for Tater and Meshtastic radios."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,7 @@ dependencies = [
   "pydantic>=2.7,<3.0",
   "python-dotenv>=1.0,<2.0",
   "PyPubSub>=4.0,<5.0",
+  "pyqrcode>=1.2,<2.0",
   "meshtastic>=2.7,<3.0",
 ]
 

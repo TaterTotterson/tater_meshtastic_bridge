@@ -26,6 +26,11 @@ class EventBuffer:
                 return 0
             return int(self._events[-1].get("event_id") or 0)
 
+    def clear(self, *, next_id: int = 1) -> None:
+        with self._lock:
+            self._events.clear()
+            self._next_id = max(1, int(next_id))
+
     def list(
         self,
         *,

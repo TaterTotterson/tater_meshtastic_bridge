@@ -1761,6 +1761,13 @@ class MeshtasticBridgeService:
             "num": resolved_num,
         }
 
+    def _is_local_node_ref(self, node: Dict[str, Any]) -> bool:
+        node_id = str((node or {}).get("node_id") or "").strip().lower()
+        if node_id and self.local_node_id and node_id == str(self.local_node_id).strip().lower():
+            return True
+        node_num = _safe_int((node or {}).get("num"), 0)
+        return bool(node_num and self.local_node_num and node_num == self.local_node_num)
+
     def _normalize_destination_ref(self, packet: Dict[str, Any], explicit_destination: Optional[str]) -> Tuple[Dict[str, Any], str]:
         if explicit_destination is not None:
             token = self._resolve_destination(explicit_destination)
@@ -1797,22 +1804,26 @@ class MeshtasticBridgeService:
         payload = dict(packet or {}) if isinstance(packet, dict) else {}
         decoded = dict(payload.get("decoded") or {})
         text = str(decoded.get("text") or fallback_text or "").strip()
+        normalized_direction = str(direction or "").strip().lower() or "inbound"
         from_ref = self._normalize_node_ref(
             node_id=str(payload.get("fromId") or "").strip(),
             node_num=payload.get("from"),
-            prefer_local=(direction == "outbound"),
+            prefer_local=(normalized_direction == "outbound"),
         )
         to_ref, delivery = self._normalize_destination_ref(payload, explicit_destination=destination)
         normalized_channel = int(channel if channel is not None else _safe_int(payload.get("channel"), 0))
 
-        if direction == "outbound":
+        if normalized_direction == "outbound":
+            from_ref = self._normalize_node_ref(node_id=self.local_node_id, prefer_local=True)
+        elif self._is_local_node_ref(from_ref):
+            normalized_direction = "outbound"
             from_ref = self._normalize_node_ref(node_id=self.local_node_id, prefer_local=True)
 
         return {
             "event_type": "message",
             "timestamp": _iso_from_unix(payload.get("rxTime") or time.time()),
             "message_id": str(payload.get("id") or payload.get("packetId") or "").strip(),
-            "direction": direction,
+            "direction": normalized_direction,
             "transport": self.transport,
             "delivery": delivery,
             "from": from_ref,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import logging
 import re
@@ -156,14 +157,33 @@ def _enum_default_name(field: FieldDescriptor) -> str:
         return ""
 
 
+def _field_is_repeated(field: FieldDescriptor) -> bool:
+    repeated = getattr(field, "is_repeated", None)
+    if repeated is not None:
+        return bool(repeated)
+    try:
+        return field.label == FieldDescriptor.LABEL_REPEATED
+    except AttributeError:
+        return False
+
+
+def _field_is_map(field: FieldDescriptor) -> bool:
+    if field.type != FieldDescriptor.TYPE_MESSAGE or not field.message_type:
+        return False
+    try:
+        return bool(field.message_type.GetOptions().map_entry)
+    except Exception:
+        return False
+
+
 def _compact_exception_message(exc: Exception) -> str:
     return " ".join(str(exc or exc.__class__.__name__).split())
 
 
 def _proto_default_value(field: FieldDescriptor, *, repeated: Optional[bool] = None) -> Any:
-    is_repeated = field.label == FieldDescriptor.LABEL_REPEATED if repeated is None else bool(repeated)
+    is_repeated = _field_is_repeated(field) if repeated is None else bool(repeated)
     if is_repeated:
-        if field.type == FieldDescriptor.TYPE_MESSAGE and field.message_type and field.message_type.GetOptions().map_entry:
+        if _field_is_map(field):
             return {}
         return []
     if field.type == FieldDescriptor.TYPE_MESSAGE:
@@ -202,7 +222,7 @@ def _single_value_field_schema(field: FieldDescriptor) -> Dict[str, Any]:
         "default": _proto_default_value(field, repeated=False),
     }
 
-    if field.type == FieldDescriptor.TYPE_MESSAGE and field.message_type and field.message_type.GetOptions().map_entry:
+    if _field_is_map(field):
         key_field = field.message_type.fields_by_name.get("key")
         value_field = field.message_type.fields_by_name.get("value")
         return {
@@ -235,9 +255,7 @@ def _single_value_field_schema(field: FieldDescriptor) -> Dict[str, Any]:
 
 
 def _field_schema(field: FieldDescriptor) -> Dict[str, Any]:
-    if field.label == FieldDescriptor.LABEL_REPEATED and not (
-        field.type == FieldDescriptor.TYPE_MESSAGE and field.message_type and field.message_type.GetOptions().map_entry
-    ):
+    if _field_is_repeated(field) and not _field_is_map(field):
         base = {
             "name": field.name,
             "label": _labelize_name(field.name),
@@ -554,7 +572,9 @@ class MeshtasticBridgeService:
             raise RuntimeError("QR generation needs pyqrcode. Reinstall the bridge package to install the latest dependencies.") from exc
 
         qr = pyqrcode.create(str(text or "").strip(), error="M")
-        svg = qr.svg_as_string(scale=5, xmldecl=False, svgns=True)
+        svg_buffer = io.BytesIO()
+        qr.svg(svg_buffer, scale=5, xmldecl=False, svgns=True)
+        svg = svg_buffer.getvalue()
         if isinstance(svg, bytes):
             return svg.decode("utf-8", errors="replace")
         return str(svg or "")

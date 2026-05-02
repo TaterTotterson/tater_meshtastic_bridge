@@ -3340,6 +3340,9 @@ function renderView() {
   if (!root) {
     return;
   }
+  const normalizedView = String(state.view || "dashboard").trim().toLowerCase();
+  root.dataset.view = normalizedView;
+  document.body.dataset.view = normalizedView;
   if (state.view === "dashboard") {
     root.innerHTML = renderDashboard();
     return;

@@ -280,6 +280,14 @@ select {
   gap: 18px;
 }
 
+.view-root[data-view="chat"] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .card-grid {
   display: grid;
   gap: 18px;
@@ -511,7 +519,9 @@ tbody tr:hover {
 }
 
 .mesh-chat-shell {
-  min-height: min(760px, calc(100vh - 170px));
+  height: min(760px, calc(100vh - 170px));
+  height: min(760px, calc(100dvh - 170px));
+  min-height: 520px;
   display: grid;
   grid-template-columns: 270px minmax(0, 1fr);
   overflow: hidden;
@@ -523,6 +533,10 @@ tbody tr:hover {
   box-shadow: var(--shadow);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
+}
+
+.view-root[data-view="chat"] .mesh-chat-shell {
+  flex: 1 1 auto;
 }
 
 .mesh-channel-rail {
@@ -664,6 +678,7 @@ tbody tr:hover {
 
 .mesh-chat-log {
   flex: 1 1 auto;
+  min-height: 0;
 }
 
 .mesh-chat-composer-card {
@@ -2164,6 +2179,34 @@ tbody tr:hover {
 
 .muted {
   color: var(--muted);
+}
+
+@media (min-width: 901px) {
+  body[data-view="chat"] .app-shell {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  body[data-view="chat"] .main-pane {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+    padding-bottom: 14px;
+  }
+
+  body[data-view="chat"] .topbar,
+  body[data-view="chat"] .notice-root {
+    flex: 0 0 auto;
+  }
+
+  body[data-view="chat"] .mesh-chat-shell {
+    height: auto;
+    min-height: 0;
+  }
 }
 
 @media (max-width: 1120px) {

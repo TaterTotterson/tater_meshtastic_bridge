@@ -1543,6 +1543,12 @@ class MeshtasticBridgeService:
         raw = _compact_exception_message(exc)
         lowered = raw.lower()
         identifier = self.settings.device_identifier or "the configured Meshtastic device"
+        linux_hint = ""
+        if sys.platform.startswith("linux"):
+            linux_hint = (
+                " On Linux, re-scan from the Linux host and save the BlueZ address or advertised name; "
+                "macOS CoreBluetooth UUIDs do not work there. Also make sure bluetoothd is running and the bridge user can access Bluetooth."
+            )
 
         if "peer removed pairing information" in lowered:
             return (
@@ -1554,21 +1560,25 @@ class MeshtasticBridgeService:
             return (
                 f"No Meshtastic BLE device was found for {identifier}. "
                 "Use Settings -> Scan for Devices and save the current name or address."
+                f"{linux_hint}"
             )
         if "more than one meshtastic ble peripheral" in lowered:
             return (
                 f"More than one Meshtastic BLE device matched {identifier}. "
                 "Use Settings -> Scan for Devices and save the exact BLE address instead of the name."
+                f"{linux_hint}"
             )
         if "failed to connect" in lowered or "connection failed" in lowered or "esp_err_http_connect" in lowered:
             return (
                 f"Could not connect to {identifier}. "
                 "Make sure the radio is nearby, powered on, not already connected to another app, and re-scan if the address changed."
+                f"{linux_hint}"
             )
         if "timed out" in lowered or "timeout" in lowered:
             return (
                 f"Timed out connecting to {identifier}. "
                 "Move the radio closer, wake/restart it, then scan again if needed."
+                f"{linux_hint}"
             )
         return raw or exc.__class__.__name__
 

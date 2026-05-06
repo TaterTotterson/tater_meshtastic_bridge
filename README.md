@@ -133,7 +133,7 @@ The easiest path is the bridge Web UI:
 The scan button uses the same Meshtastic BLE discovery as this terminal command:
 
 ```bash
-cd /Users/ahphooey/Scripts/Tater_Meshtastic_Bridge
+cd /path/to/Tater_Meshtastic_Bridge
 source .venv/bin/activate
 meshtastic --ble-scan
 ```
@@ -151,6 +151,28 @@ BLE Device Address = exact-address-from-scan
 ```
 
 Using the BLE address is usually more reliable than matching by name.
+
+### Linux BLE notes
+
+Linux uses BlueZ addresses and names, not the macOS CoreBluetooth UUID shown by Apple devices. If you move the bridge from macOS to Linux, scan again on the Linux host and save the Linux-discovered BLE address or advertised name in the Web UI Settings tab.
+
+On Debian/Ubuntu-style systems, make sure the Bluetooth service is running and your bridge user can access it:
+
+```bash
+sudo apt install bluetooth bluez
+sudo systemctl enable --now bluetooth
+sudo usermod -aG bluetooth "$USER"
+```
+
+Log out and back in after changing groups. If the scan still fails, test from the same venv/user that runs the bridge:
+
+```bash
+cd /path/to/Tater_Meshtastic_Bridge
+source .venv/bin/activate
+meshtastic --ble-scan
+```
+
+Only one app can usually hold the BLE connection at a time, so disconnect phone apps, the macOS bridge, or other Meshtastic clients before connecting from Linux.
 
 If the scan finds nothing:
 

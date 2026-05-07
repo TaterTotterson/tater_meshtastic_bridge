@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
@@ -1585,6 +1586,7 @@ class MeshtasticBridgeService:
     def _connect_once(self) -> None:
         meshtastic_module, pub = self._load_meshtastic_dependencies()
         ble_module = importlib.import_module("meshtastic.ble_interface")
+        self._install_linux_ble_connect_timeout(ble_module)
         interface_cls = getattr(ble_module, "BLEInterface")
 
         self._disconnect_event.clear()
@@ -1626,6 +1628,56 @@ class MeshtasticBridgeService:
         )
         self.snapshot_state()
         logger.info("Meshtastic BLE connection established")
+
+    def _install_linux_ble_connect_timeout(self, ble_module: Any) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+
+        interface_cls = getattr(ble_module, "BLEInterface", None)
+        client_cls = getattr(ble_module, "BLEClient", None)
+        if interface_cls is None or client_cls is None:
+            return
+
+        timeout = max(5.0, float(self.settings.connect_timeout_seconds or 60))
+        setattr(interface_cls, "_tater_connect_timeout", timeout)
+        if getattr(interface_cls, "_tater_connect_timeout_patched", False):
+            return
+
+        def connect_with_timeout(interface_self: Any, address: Optional[str] = None) -> Any:
+            operation_timeout = max(5.0, float(getattr(interface_cls, "_tater_connect_timeout", timeout) or timeout))
+            device = interface_self.find_device(address)
+            client = client_cls(
+                device.address,
+                disconnected_callback=lambda _: interface_self.close(),
+                timeout=operation_timeout,
+            )
+            try:
+                logger.info("Opening Linux BLE GATT connection to %s", device.address)
+                client.async_await(client.bleak_client.connect(), timeout=operation_timeout)
+                client.discover(timeout=min(10.0, operation_timeout))
+                return client
+            except FutureTimeoutError as exc:
+                MeshtasticBridgeService._close_timed_out_ble_client(client)
+                raise interface_cls.BLEError(
+                    f"Timed out opening BLE GATT connection to {device.address} after {operation_timeout:.0f}s"
+                ) from exc
+            except Exception:
+                MeshtasticBridgeService._close_timed_out_ble_client(client)
+                raise
+
+        setattr(interface_cls, "connect", connect_with_timeout)
+        setattr(interface_cls, "_tater_connect_timeout_patched", True)
+
+    @staticmethod
+    def _close_timed_out_ble_client(client: Any) -> None:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def _load_meshtastic_dependencies(self) -> Tuple[Any, Any]:
         if self._meshtastic_module is not None and self._pub is not None:

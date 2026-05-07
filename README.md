@@ -172,6 +172,12 @@ source .venv/bin/activate
 meshtastic --ble-scan
 ```
 
+Do not manually connect the radio in the desktop Bluetooth settings before starting the bridge. The bridge opens its own BLE/GATT session through BlueZ, and a desktop-held connection can leave the bridge stuck waiting for access. If you already connected it manually, disconnect it first:
+
+```bash
+bluetoothctl disconnect <linux-ble-address>
+```
+
 Only one app can usually hold the BLE connection at a time, so disconnect phone apps, the macOS bridge, or other Meshtastic clients before connecting from Linux.
 
 If the scan finds nothing:

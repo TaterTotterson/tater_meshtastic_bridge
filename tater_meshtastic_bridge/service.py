@@ -375,6 +375,8 @@ class MeshtasticBridgeService:
         self._lock = Lock()
         self._radio_lock = RLock()
         self._ble_scan_lock = Lock()
+        self._connect_attempt_lock = Lock()
+        self._connect_attempt_id = 0
         self._stop_event = Event()
         self._disconnect_event = Event()
         self._worker: Optional[Thread] = None
@@ -1526,7 +1528,7 @@ class MeshtasticBridgeService:
         while not self._stop_event.is_set():
             try:
                 self._set_state(connected=False, state="connecting", error="")
-                self._connect_once()
+                self._connect_once_with_watchdog()
                 self.reconnect_attempt = 0
                 while not self._stop_event.is_set():
                     if self._disconnect_event.wait(0.5):
@@ -1591,7 +1593,49 @@ class MeshtasticBridgeService:
             )
         return raw or exc.__class__.__name__
 
-    def _connect_once(self) -> None:
+    def _next_connect_attempt_id(self) -> int:
+        with self._connect_attempt_lock:
+            self._connect_attempt_id += 1
+            return self._connect_attempt_id
+
+    def _invalidate_connect_attempt(self, attempt_id: int) -> None:
+        with self._connect_attempt_lock:
+            if self._connect_attempt_id == int(attempt_id):
+                self._connect_attempt_id += 1
+
+    def _connect_attempt_is_current(self, attempt_id: int) -> bool:
+        with self._connect_attempt_lock:
+            return self._connect_attempt_id == int(attempt_id)
+
+    def _connect_once_with_watchdog(self) -> None:
+        attempt_id = self._next_connect_attempt_id()
+        if not sys.platform.startswith("linux"):
+            self._connect_once(attempt_id=attempt_id)
+            return
+
+        timeout = max(15.0, float(self.settings.connect_timeout_seconds or 60))
+        done = Event()
+        result: Dict[str, Any] = {}
+        logger.info("Linux BLE connection watchdog armed for %.0fs", timeout)
+
+        def run_connect() -> None:
+            try:
+                self._connect_once(attempt_id=attempt_id)
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+        Thread(target=run_connect, name=f"meshtastic-ble-connect-{attempt_id}", daemon=True).start()
+        if not done.wait(timeout):
+            self._invalidate_connect_attempt(attempt_id)
+            raise FutureTimeoutError(f"Linux BLE connection attempt did not finish after {timeout:.0f}s")
+
+        error = result.get("error")
+        if error:
+            raise error
+
+    def _connect_once(self, *, attempt_id: int) -> None:
         meshtastic_module, pub = self._load_meshtastic_dependencies()
         ble_module = importlib.import_module("meshtastic.ble_interface")
         self._install_linux_ble_timeouts(ble_module)
@@ -1610,11 +1654,16 @@ class MeshtasticBridgeService:
 
         identifier = self.settings.device_identifier
         logger.info("Connecting to Meshtastic BLE node %s", identifier or "(first available)")
-        self._interface = interface_cls(
+        interface = interface_cls(
             identifier,
             timeout=int(self.settings.connect_timeout_seconds),
             noNodes=bool(self.settings.no_nodes),
         )
+        if not self._connect_attempt_is_current(attempt_id):
+            logger.warning("Discarding stale Meshtastic BLE connection attempt %s", attempt_id)
+            self._close_stale_interface(interface)
+            raise RuntimeError("Stale Meshtastic BLE connection attempt completed after timeout.")
+        self._interface = interface
         self._refresh_local_identity()
         self._broadcast_addr = str(getattr(meshtastic_module, "BROADCAST_ADDR", "^all") or "^all").strip() or "^all"
         self._broadcast_num = _safe_int(getattr(meshtastic_module, "BROADCAST_NUM", 0xFFFFFFFF), 0xFFFFFFFF)
@@ -1680,14 +1729,14 @@ class MeshtasticBridgeService:
                     f"Timed out scanning for Meshtastic BLE devices after {operation_timeout:.0f}s"
                 ) from exc
             client = client_cls(
-                device.address,
+                device,
                 disconnected_callback=lambda _: interface_self.close(),
                 timeout=operation_timeout,
             )
             try:
-                logger.info("Opening Linux BLE GATT connection to %s", device.address)
+                logger.info("Opening Linux BLE GATT connection to %s with %.0fs timeout", device.address, operation_timeout)
                 client.async_await(client.bleak_client.connect(), timeout=operation_timeout)
-                client.discover(timeout=min(10.0, operation_timeout))
+                logger.info("Linux BLE GATT connection opened to %s", device.address)
                 return client
             except FutureTimeoutError as exc:
                 MeshtasticBridgeService._close_timed_out_ble_client(client)
@@ -1720,6 +1769,25 @@ class MeshtasticBridgeService:
             Thread(target=run_action, name=f"ble-client-{action_name}", daemon=True).start()
             if not done.wait(2.0):
                 logger.warning("Timed out waiting for BLE client %s cleanup; continuing", action_name)
+
+    @staticmethod
+    def _close_stale_interface(interface: Any) -> None:
+        close_fn = getattr(interface, "close", None)
+        if not callable(close_fn):
+            return
+        done = Event()
+
+        def run_close() -> None:
+            try:
+                close_fn()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        Thread(target=run_close, name="stale-ble-interface-close", daemon=True).start()
+        if not done.wait(2.0):
+            logger.warning("Timed out waiting for stale BLE interface cleanup; continuing")
 
     def _load_meshtastic_dependencies(self) -> Tuple[Any, Any]:
         if self._meshtastic_module is not None and self._pub is not None:

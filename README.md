@@ -188,6 +188,16 @@ If the scan finds nothing:
 - Close other apps that may already be connected to the node
 - Approve any macOS Bluetooth permission or pairing prompt if it appears
 
+If Linux scans the node but times out while opening the BLE/GATT connection, BlueZ usually has a stale connection or cached device record. Clean it up from the Linux host, then start the bridge again:
+
+```bash
+bluetoothctl disconnect <linux-ble-address>
+bluetoothctl remove <linux-ble-address>
+sudo systemctl restart bluetooth
+```
+
+Then scan again from the bridge UI or run `meshtastic --ble-scan` from the bridge venv and save the fresh Linux address.
+
 ## Notes
 
 - The service uses the official Meshtastic Python package and its pubsub event model.

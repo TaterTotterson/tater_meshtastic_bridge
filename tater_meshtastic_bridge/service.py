@@ -1585,6 +1585,11 @@ class MeshtasticBridgeService:
                 "Make sure the radio is nearby, powered on, not already connected to another app, and re-scan if the address changed."
                 f"{linux_hint}"
             )
+        if sys.platform.startswith("linux") and "opening ble gatt connection" in lowered:
+            return (
+                f"BlueZ found {identifier}, but Linux timed out opening the BLE/GATT connection. "
+                "Disconnect the radio from desktop Bluetooth, then run bluetoothctl disconnect/remove for the Linux BLE address and restart bluetoothd if it still times out."
+            )
         if "timed out" in lowered or "timeout" in lowered:
             return (
                 f"Timed out connecting to {identifier}. "
@@ -1720,6 +1725,8 @@ class MeshtasticBridgeService:
         if getattr(interface_cls, "_tater_connect_timeout_patched", False):
             return
 
+        service_uuid = str(getattr(ble_module, "SERVICE_UUID", "") or "").strip()
+
         def connect_with_timeout(interface_self: Any, address: Optional[str] = None) -> Any:
             operation_timeout = max(5.0, float(getattr(interface_cls, "_tater_connect_timeout", timeout) or timeout))
             try:
@@ -1728,11 +1735,14 @@ class MeshtasticBridgeService:
                 raise interface_cls.BLEError(
                     f"Timed out scanning for Meshtastic BLE devices after {operation_timeout:.0f}s"
                 ) from exc
-            client = client_cls(
-                device,
-                disconnected_callback=lambda _: interface_self.close(),
-                timeout=operation_timeout,
-            )
+            self._linux_bluez_disconnect_device(device.address)
+            client_kwargs: Dict[str, Any] = {
+                "disconnected_callback": lambda _: interface_self.close(),
+                "timeout": operation_timeout,
+            }
+            if service_uuid:
+                client_kwargs["services"] = [service_uuid]
+            client = client_cls(device, **client_kwargs)
             try:
                 logger.info("Opening Linux BLE GATT connection to %s with %.0fs timeout", device.address, operation_timeout)
                 client.async_await(client.bleak_client.connect(), timeout=operation_timeout)
@@ -1740,6 +1750,7 @@ class MeshtasticBridgeService:
                 return client
             except FutureTimeoutError as exc:
                 MeshtasticBridgeService._close_timed_out_ble_client(client)
+                MeshtasticBridgeService._linux_bluez_disconnect_device(device.address)
                 raise interface_cls.BLEError(
                     f"Timed out opening BLE GATT connection to {device.address} after {operation_timeout:.0f}s"
                 ) from exc
@@ -1769,6 +1780,33 @@ class MeshtasticBridgeService:
             Thread(target=run_action, name=f"ble-client-{action_name}", daemon=True).start()
             if not done.wait(2.0):
                 logger.warning("Timed out waiting for BLE client %s cleanup; continuing", action_name)
+
+    @staticmethod
+    def _linux_bluez_disconnect_device(address: Any) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        token = str(address or "").strip()
+        if not token:
+            return
+        try:
+            result = subprocess.run(
+                ["bluetoothctl", "disconnect", token],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except FileNotFoundError:
+            logger.debug("bluetoothctl is not installed; skipping BlueZ pre-disconnect")
+            return
+        except subprocess.TimeoutExpired:
+            logger.warning("Timed out asking BlueZ to disconnect %s before BLE connect", token)
+            return
+        output = " ".join(((result.stdout or "") + " " + (result.stderr or "")).split())
+        if result.returncode == 0:
+            logger.debug("BlueZ disconnect check for %s: %s", token, output or "ok")
+        else:
+            logger.debug("BlueZ disconnect check for %s returned %s: %s", token, result.returncode, output)
 
     @staticmethod
     def _close_stale_interface(interface: Any) -> None:

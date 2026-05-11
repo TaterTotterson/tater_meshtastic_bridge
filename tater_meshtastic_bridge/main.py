@@ -62,6 +62,7 @@ class RuntimeSettingsRequest(BaseModel):
     port: Optional[int] = Field(None, ge=1, le=65535)
     device_name: Optional[str] = None
     device_address: Optional[str] = None
+    ble_pair: Optional[bool] = None
     api_token: Optional[str] = None
     reconnect_seconds: Optional[float] = Field(None, ge=1.0)
     connect_timeout_seconds: Optional[int] = Field(None, ge=5)

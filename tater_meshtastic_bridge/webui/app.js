@@ -3173,6 +3173,14 @@ function renderSettings() {
               <input id="runtime-device-address" name="device_address" value="${escapeHtml(values.device_address || "")}" placeholder="BLE address from meshtastic --ble-scan" />
               ${settingHelper("device_address", sources, "Address is usually more reliable than name.")}
             </div>
+            <div class="field">
+              <label for="runtime-ble-pair">Pair On BLE Connect</label>
+              <select id="runtime-ble-pair" name="ble_pair">
+                <option value="false" ${selectedAttr(Boolean(values.ble_pair), false)}>False</option>
+                <option value="true" ${selectedAttr(Boolean(values.ble_pair), true)}>True</option>
+              </select>
+              ${settingHelper("ble_pair", sources, "Enable if Linux needs a PIN prompt before the radio config handshake completes.")}
+            </div>
             <div class="field runtime-scan-field">
               ${renderBleScanPanel(values)}
             </div>
@@ -3631,6 +3639,7 @@ async function handleFormSubmit(form) {
       const payload = {
         device_name: form.device_name.value.trim(),
         device_address: form.device_address.value.trim(),
+        ble_pair: form.ble_pair.value === "true",
         api_token: nextToken,
       };
       const requestAuthToken = String(state.token || "").trim() || nextToken;

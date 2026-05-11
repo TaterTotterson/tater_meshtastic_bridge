@@ -957,6 +957,7 @@ class MeshtasticBridgeService:
             "database_path": self.settings.database_path,
             "device_name": self.settings.device_name,
             "device_address": self.settings.device_address,
+            "ble_pair": bool(self.settings.ble_pair),
             "api_token": self.settings.api_token,
             "reconnect_seconds": float(self.settings.reconnect_seconds),
             "connect_timeout_seconds": int(self.settings.connect_timeout_seconds),
@@ -976,6 +977,7 @@ class MeshtasticBridgeService:
             "port": _coerce_int(raw.get("port", current["port"]), int(current["port"] or DEFAULT_BRIDGE_PORT), minimum=1, maximum=65535),
             "device_name": str(raw.get("device_name", current["device_name"]) or "").strip(),
             "device_address": str(raw.get("device_address", current["device_address"]) or "").strip(),
+            "ble_pair": _coerce_bool(raw.get("ble_pair", current["ble_pair"]), bool(current["ble_pair"])),
             "api_token": str(raw.get("api_token", current["api_token"]) or "").strip(),
             "reconnect_seconds": _coerce_float(raw.get("reconnect_seconds", current["reconnect_seconds"]), float(current["reconnect_seconds"] or 10.0), minimum=1.0),
             "connect_timeout_seconds": _coerce_int(raw.get("connect_timeout_seconds", current["connect_timeout_seconds"]), int(current["connect_timeout_seconds"] or 60), minimum=5),
@@ -1593,7 +1595,7 @@ class MeshtasticBridgeService:
         if "timed out" in lowered or "timeout" in lowered:
             return (
                 f"Timed out connecting to {identifier}. "
-                "Move the radio closer, wake/restart it, then scan again if needed."
+                "Move the radio closer, wake/restart it, pair/trust it if the radio requires a PIN, then scan again if needed."
                 f"{linux_hint}"
             )
         return raw or exc.__class__.__name__
@@ -1738,12 +1740,15 @@ class MeshtasticBridgeService:
             self._linux_bluez_disconnect_device(device.address)
             client_kwargs: Dict[str, Any] = {
                 "disconnected_callback": lambda _: interface_self.close(),
+                "pair": bool(self.settings.ble_pair),
                 "timeout": operation_timeout,
             }
             if service_uuid:
                 client_kwargs["services"] = [service_uuid]
             client = client_cls(device, **client_kwargs)
             try:
+                if self.settings.ble_pair:
+                    logger.info("Linux BLE pairing is enabled for %s; watch for a BlueZ PIN prompt", device.address)
                 logger.info("Opening Linux BLE GATT connection to %s with %.0fs timeout", device.address, operation_timeout)
                 client.async_await(client.bleak_client.connect(), timeout=operation_timeout)
                 logger.info("Linux BLE GATT connection opened to %s", device.address)

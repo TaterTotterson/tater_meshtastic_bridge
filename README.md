@@ -180,6 +180,20 @@ bluetoothctl disconnect <linux-ble-address>
 
 Only one app can usually hold the BLE connection at a time, so disconnect phone apps, the macOS bridge, or other Meshtastic clients before connecting from Linux.
 
+If the bridge opens the GATT connection but then times out waiting for the radio config, the node may require BLE pairing before Meshtastic characteristics are usable. Pair and trust it once from Linux:
+
+```bash
+bluetoothctl
+agent KeyboardDisplay
+default-agent
+scan on
+pair <linux-ble-address>
+trust <linux-ble-address>
+quit
+```
+
+If your desktop environment supplies the PIN prompt, you can also enable **Pair On BLE Connect** in the bridge Settings tab and restart/reconnect. Headless Linux hosts usually need the `bluetoothctl` pairing flow above.
+
 If the scan finds nothing:
 
 - Make sure Bluetooth is enabled on the host

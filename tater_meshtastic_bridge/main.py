@@ -63,6 +63,7 @@ class RuntimeSettingsRequest(BaseModel):
     device_name: Optional[str] = None
     device_address: Optional[str] = None
     ble_pair: Optional[bool] = None
+    ble_pin: Optional[str] = None
     api_token: Optional[str] = None
     reconnect_seconds: Optional[float] = Field(None, ge=1.0)
     connect_timeout_seconds: Optional[int] = Field(None, ge=5)

@@ -192,7 +192,7 @@ trust <linux-ble-address>
 quit
 ```
 
-If your desktop environment supplies the PIN prompt, you can also enable **Pair On BLE Connect** in the bridge Settings tab and restart/reconnect. Headless Linux hosts usually need the `bluetoothctl` pairing flow above.
+If your desktop environment supplies the PIN prompt, you can also enable **Pair On BLE Connect** in the bridge Settings tab and restart/reconnect. For headless Linux hosts, enter the node's fixed or currently displayed PIN in **BLE Pairing PIN** too; the bridge will run a Linux `bluetoothctl` pairing/trust pass before opening the Meshtastic BLE session.
 
 If the scan finds nothing:
 

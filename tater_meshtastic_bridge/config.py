@@ -20,6 +20,7 @@ BRIDGE_SETTING_KEYS = (
     "device_name",
     "device_address",
     "ble_pair",
+    "ble_pin",
     "api_token",
     "reconnect_seconds",
     "connect_timeout_seconds",
@@ -37,6 +38,7 @@ RESTART_REQUIRED_SETTINGS = {
     "device_name",
     "device_address",
     "ble_pair",
+    "ble_pin",
     "connect_timeout_seconds",
     "event_buffer_size",
     "no_nodes",
@@ -48,6 +50,7 @@ ENV_NAMES = {
     "device_name": "MESHTASTIC_DEVICE_NAME",
     "device_address": "MESHTASTIC_DEVICE_ADDRESS",
     "ble_pair": "MESHTASTIC_BLE_PAIR",
+    "ble_pin": "MESHTASTIC_BLE_PIN",
     "api_token": "MESHTASTIC_API_TOKEN",
     "reconnect_seconds": "MESHTASTIC_RECONNECT_SECONDS",
     "connect_timeout_seconds": "MESHTASTIC_CONNECT_TIMEOUT_SECONDS",
@@ -65,6 +68,7 @@ DEFAULT_BRIDGE_SETTINGS: Dict[str, Any] = {
     "device_name": "",
     "device_address": "",
     "ble_pair": False,
+    "ble_pin": "",
     "api_token": "",
     "reconnect_seconds": 10.0,
     "connect_timeout_seconds": 60,
@@ -149,6 +153,7 @@ class Settings:
     device_name: str
     device_address: str
     ble_pair: bool
+    ble_pin: str
     api_token: str
     reconnect_seconds: float
     connect_timeout_seconds: int
@@ -238,6 +243,7 @@ def load_settings() -> Settings:
         device_name=str(raw_values.get("device_name") or "").strip(),
         device_address=str(raw_values.get("device_address") or "").strip(),
         ble_pair=_coerce_bool(raw_values.get("ble_pair"), False),
+        ble_pin=str(raw_values.get("ble_pin") or "").strip(),
         api_token=str(raw_values.get("api_token") or "").strip(),
         reconnect_seconds=_coerce_float(raw_values.get("reconnect_seconds"), 10.0, minimum=1.0),
         connect_timeout_seconds=_coerce_int(raw_values.get("connect_timeout_seconds"), 60, minimum=5),

@@ -3181,6 +3181,11 @@ function renderSettings() {
               </select>
               ${settingHelper("ble_pair", sources, "Enable if Linux needs a PIN prompt before the radio config handshake completes.")}
             </div>
+            <div class="field">
+              <label for="runtime-ble-pin">BLE Pairing PIN</label>
+              <input id="runtime-ble-pin" name="ble_pin" value="${escapeHtml(values.ble_pin || "")}" inputmode="numeric" autocomplete="off" placeholder="123456" />
+              ${settingHelper("ble_pin", sources, "Optional. Used by the Linux pairing helper when Pair On BLE Connect is enabled.")}
+            </div>
             <div class="field runtime-scan-field">
               ${renderBleScanPanel(values)}
             </div>
@@ -3640,6 +3645,7 @@ async function handleFormSubmit(form) {
         device_name: form.device_name.value.trim(),
         device_address: form.device_address.value.trim(),
         ble_pair: form.ble_pair.value === "true",
+        ble_pin: form.ble_pin.value.trim(),
         api_token: nextToken,
       };
       const requestAuthToken = String(state.token || "").trim() || nextToken;

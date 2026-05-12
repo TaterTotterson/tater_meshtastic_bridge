@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -958,6 +959,7 @@ class MeshtasticBridgeService:
             "device_name": self.settings.device_name,
             "device_address": self.settings.device_address,
             "ble_pair": bool(self.settings.ble_pair),
+            "ble_pin": self.settings.ble_pin,
             "api_token": self.settings.api_token,
             "reconnect_seconds": float(self.settings.reconnect_seconds),
             "connect_timeout_seconds": int(self.settings.connect_timeout_seconds),
@@ -978,6 +980,7 @@ class MeshtasticBridgeService:
             "device_name": str(raw.get("device_name", current["device_name"]) or "").strip(),
             "device_address": str(raw.get("device_address", current["device_address"]) or "").strip(),
             "ble_pair": _coerce_bool(raw.get("ble_pair", current["ble_pair"]), bool(current["ble_pair"])),
+            "ble_pin": str(raw.get("ble_pin", current["ble_pin"]) or "").strip(),
             "api_token": str(raw.get("api_token", current["api_token"]) or "").strip(),
             "reconnect_seconds": _coerce_float(raw.get("reconnect_seconds", current["reconnect_seconds"]), float(current["reconnect_seconds"] or 10.0), minimum=1.0),
             "connect_timeout_seconds": _coerce_int(raw.get("connect_timeout_seconds", current["connect_timeout_seconds"]), int(current["connect_timeout_seconds"] or 60), minimum=5),
@@ -1737,6 +1740,8 @@ class MeshtasticBridgeService:
                 raise interface_cls.BLEError(
                     f"Timed out scanning for Meshtastic BLE devices after {operation_timeout:.0f}s"
                 ) from exc
+            if self.settings.ble_pair:
+                self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout)
             self._linux_bluez_disconnect_device(device.address)
             client_kwargs: Dict[str, Any] = {
                 "disconnected_callback": lambda _: interface_self.close(),
@@ -1812,6 +1817,155 @@ class MeshtasticBridgeService:
             logger.debug("BlueZ disconnect check for %s: %s", token, output or "ok")
         else:
             logger.debug("BlueZ disconnect check for %s returned %s: %s", token, result.returncode, output)
+
+    @staticmethod
+    def _linux_bluez_pair_device(address: Any, *, pin: str = "", timeout: float = 45.0) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        token = str(address or "").strip()
+        if not token:
+            return
+        pin = str(pin or "").strip()
+        safe_token = token
+        logger.info("Preparing Linux BLE pairing/trust for %s", safe_token)
+
+        try:
+            output = MeshtasticBridgeService._run_bluetoothctl_pair_session(
+                token,
+                pin=pin,
+                timeout=max(15.0, float(timeout or 45.0)),
+            )
+        except FileNotFoundError:
+            logger.warning("bluetoothctl is not installed; cannot pair %s from the bridge", safe_token)
+            return
+        except Exception as exc:
+            logger.warning("BlueZ pairing helper failed for %s: %s", safe_token, _compact_exception_message(exc))
+            logger.debug("BlueZ pairing helper failed", exc_info=True)
+            return
+
+        safe_output = output.replace(pin, "******") if pin else output
+        compact = " ".join(safe_output.split())
+        lowered = safe_output.lower()
+        if "pairing successful" in lowered or "already exists" in lowered or "already paired" in lowered:
+            logger.info("BlueZ pairing/trust completed for %s", safe_token)
+        elif "authentication" in lowered or "pin" in lowered or "passkey" in lowered:
+            logger.warning(
+                "BlueZ pairing for %s may still need a PIN/passkey. Pairing output: %s",
+                safe_token,
+                compact[-500:],
+            )
+        else:
+            logger.debug("BlueZ pairing output for %s: %s", safe_token, compact[-500:])
+
+    @staticmethod
+    def _run_bluetoothctl_pair_session(address: str, *, pin: str = "", timeout: float = 45.0) -> str:
+        import pty
+        import select
+
+        master_fd, slave_fd = pty.openpty()
+        proc = subprocess.Popen(
+            ["bluetoothctl"],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        os.set_blocking(master_fd, False)
+        output_parts: List[str] = []
+
+        def read_available(wait: float = 0.1) -> str:
+            chunk_parts: List[str] = []
+            while True:
+                ready, _, _ = select.select([master_fd], [], [], wait)
+                if not ready:
+                    break
+                wait = 0.0
+                try:
+                    data = os.read(master_fd, 4096)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+                if not data:
+                    break
+                text = data.decode("utf-8", errors="replace")
+                output_parts.append(text)
+                chunk_parts.append(text)
+            return "".join(chunk_parts)
+
+        def send(line: str) -> None:
+            os.write(master_fd, f"{line}\n".encode("utf-8"))
+
+        try:
+            deadline = time.monotonic() + max(15.0, float(timeout or 45.0))
+            read_available(0.3)
+            for command in ("agent KeyboardDisplay", "default-agent"):
+                send(command)
+                time.sleep(0.2)
+                read_available(0.2)
+
+            send(f"pair {address}")
+            sent_pin_at = -1
+            sent_yes_at = -1
+            pair_done = False
+            while time.monotonic() < deadline:
+                read_available(0.2)
+                output = "".join(output_parts)
+                lowered = output.lower()
+                output_len = len(output)
+                pin_tail = lowered[max(sent_pin_at, 0) :]
+                yes_tail = lowered[max(sent_yes_at, 0) :]
+                if pin and (
+                    "enter pin" in pin_tail
+                    or "pin code" in pin_tail
+                    or "enter passkey" in pin_tail
+                    or "request passkey" in pin_tail
+                ):
+                    send(pin)
+                    sent_pin_at = output_len
+                    continue
+                if (
+                    "confirm passkey" in yes_tail
+                    or "authorize service" in yes_tail
+                    or "(yes/no)" in yes_tail
+                ):
+                    send("yes")
+                    sent_yes_at = output_len
+                    continue
+                if (
+                    "pairing successful" in lowered
+                    or "failed to pair" in lowered
+                    or "already exists" in lowered
+                    or "already paired" in lowered
+                    or "authentication canceled" in lowered
+                    or "authentication failed" in lowered
+                ):
+                    pair_done = True
+                    break
+            if not pair_done:
+                raise TimeoutError(f"Timed out waiting {int(timeout)}s for bluetoothctl pairing to finish")
+
+            for command in (f"trust {address}", f"disconnect {address}", "quit"):
+                send(command)
+                time.sleep(0.2)
+                read_available(0.2)
+            return "".join(output_parts)
+        finally:
+            try:
+                send("quit")
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
 
     @staticmethod
     def _close_stale_interface(interface: Any) -> None:

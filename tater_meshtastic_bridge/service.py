@@ -1595,6 +1595,11 @@ class MeshtasticBridgeService:
                 f"BlueZ found {identifier}, but Linux timed out opening the BLE/GATT connection. "
                 "Disconnect the radio from desktop Bluetooth, then run bluetoothctl disconnect/remove for the Linux BLE address and restart bluetoothd if it still times out."
             )
+        if sys.platform.startswith("linux") and ("bluez pairing failed" in lowered or "bluetoothctl" in lowered):
+            return (
+                f"Linux Bluetooth pairing failed for {identifier}. "
+                "Remove the device from BlueZ, confirm the saved BLE Pairing PIN is current, then reconnect from the bridge."
+            )
         if "timed out" in lowered or "timeout" in lowered:
             return (
                 f"Timed out connecting to {identifier}. "
@@ -1745,28 +1750,37 @@ class MeshtasticBridgeService:
             self._linux_bluez_disconnect_device(device.address)
             client_kwargs: Dict[str, Any] = {
                 "disconnected_callback": lambda _: interface_self.close(),
-                "pair": bool(self.settings.ble_pair),
+                "pair": False,
                 "timeout": operation_timeout,
             }
             if service_uuid:
                 client_kwargs["services"] = [service_uuid]
-            client = client_cls(device, **client_kwargs)
-            try:
-                if self.settings.ble_pair:
-                    logger.info("Linux BLE pairing is enabled for %s; watch for a BlueZ PIN prompt", device.address)
-                logger.info("Opening Linux BLE GATT connection to %s with %.0fs timeout", device.address, operation_timeout)
-                client.async_await(client.bleak_client.connect(), timeout=operation_timeout)
-                logger.info("Linux BLE GATT connection opened to %s", device.address)
-                return client
-            except FutureTimeoutError as exc:
-                MeshtasticBridgeService._close_timed_out_ble_client(client)
-                MeshtasticBridgeService._linux_bluez_disconnect_device(device.address)
-                raise interface_cls.BLEError(
-                    f"Timed out opening BLE GATT connection to {device.address} after {operation_timeout:.0f}s"
-                ) from exc
-            except Exception:
-                MeshtasticBridgeService._close_timed_out_ble_client(client)
-                raise
+            retried_auth = False
+            while True:
+                client = client_cls(device, **client_kwargs)
+                try:
+                    if self.settings.ble_pair:
+                        logger.info("Linux BLE pairing is enabled for %s; watch for a BlueZ PIN prompt", device.address)
+                    logger.info("Opening Linux BLE GATT connection to %s with %.0fs timeout", device.address, operation_timeout)
+                    client.async_await(client.bleak_client.connect(), timeout=operation_timeout)
+                    logger.info("Linux BLE GATT connection opened to %s", device.address)
+                    return client
+                except FutureTimeoutError as exc:
+                    MeshtasticBridgeService._close_timed_out_ble_client(client)
+                    MeshtasticBridgeService._linux_bluez_disconnect_device(device.address)
+                    raise interface_cls.BLEError(
+                        f"Timed out opening BLE GATT connection to {device.address} after {operation_timeout:.0f}s"
+                    ) from exc
+                except Exception as exc:
+                    MeshtasticBridgeService._close_timed_out_ble_client(client)
+                    if self.settings.ble_pair and not retried_auth and self._exception_looks_like_bluetooth_auth(exc):
+                        retried_auth = True
+                        logger.warning("BlueZ authentication failed for %s; removing stale bond and retrying once", device.address)
+                        self._linux_bluez_remove_device(device.address)
+                        self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout)
+                        self._linux_bluez_disconnect_device(device.address)
+                        continue
+                    raise
 
         setattr(interface_cls, "connect", connect_with_timeout)
         setattr(interface_cls, "_tater_connect_timeout_patched", True)
@@ -1819,6 +1833,71 @@ class MeshtasticBridgeService:
             logger.debug("BlueZ disconnect check for %s returned %s: %s", token, result.returncode, output)
 
     @staticmethod
+    def _exception_looks_like_bluetooth_auth(exc: Exception) -> bool:
+        text = _compact_exception_message(exc).lower()
+        return "auth" in text or "pin" in text or "passkey" in text
+
+    @staticmethod
+    def _run_bluetoothctl_command(*args: str, timeout: float = 5.0) -> str:
+        result = subprocess.run(
+            ["bluetoothctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+
+    @staticmethod
+    def _linux_bluez_device_flags(address: str) -> Tuple[bool, bool]:
+        try:
+            output = MeshtasticBridgeService._run_bluetoothctl_command("info", address, timeout=5)
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            logger.debug("Unable to read BlueZ device info for %s: %s", address, _compact_exception_message(exc))
+            return False, False
+
+        paired = False
+        trusted = False
+        for raw_line in output.splitlines():
+            line = raw_line.strip().lower()
+            if line.startswith("paired:"):
+                paired = line.split(":", 1)[1].strip() == "yes"
+            elif line.startswith("trusted:"):
+                trusted = line.split(":", 1)[1].strip() == "yes"
+        return paired, trusted
+
+    @staticmethod
+    def _linux_bluez_trust_device(address: str) -> None:
+        try:
+            output = MeshtasticBridgeService._run_bluetoothctl_command("trust", address, timeout=5)
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            logger.debug("Unable to trust BlueZ device %s: %s", address, _compact_exception_message(exc))
+            return
+        compact = " ".join(output.split())
+        logger.debug("BlueZ trust check for %s: %s", address, compact or "ok")
+
+    @staticmethod
+    def _linux_bluez_remove_device(address: Any) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        token = str(address or "").strip()
+        if not token:
+            return
+        try:
+            output = MeshtasticBridgeService._run_bluetoothctl_command("remove", token, timeout=5)
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            logger.warning("Unable to remove stale BlueZ bond for %s: %s", token, _compact_exception_message(exc))
+            return
+        compact = " ".join(output.split())
+        logger.info("Removed stale BlueZ bond for %s: %s", token, compact or "ok")
+
+    @staticmethod
     def _linux_bluez_pair_device(address: Any, *, pin: str = "", timeout: float = 45.0) -> None:
         if not sys.platform.startswith("linux"):
             return
@@ -1830,6 +1909,13 @@ class MeshtasticBridgeService:
         logger.info("Preparing Linux BLE pairing/trust for %s", safe_token)
 
         try:
+            paired, trusted = MeshtasticBridgeService._linux_bluez_device_flags(token)
+            if paired:
+                if not trusted:
+                    MeshtasticBridgeService._linux_bluez_trust_device(token)
+                logger.info("BlueZ device %s is already paired; skipping pairing prompt", safe_token)
+                return
+
             output = MeshtasticBridgeService._run_bluetoothctl_pair_session(
                 token,
                 pin=pin,
@@ -1837,25 +1923,21 @@ class MeshtasticBridgeService:
             )
         except FileNotFoundError:
             logger.warning("bluetoothctl is not installed; cannot pair %s from the bridge", safe_token)
-            return
+            raise RuntimeError("bluetoothctl is not installed; cannot pair the BLE device from the bridge.")
         except Exception as exc:
             logger.warning("BlueZ pairing helper failed for %s: %s", safe_token, _compact_exception_message(exc))
             logger.debug("BlueZ pairing helper failed", exc_info=True)
-            return
+            raise
 
         safe_output = output.replace(pin, "******") if pin else output
         compact = " ".join(safe_output.split())
         lowered = safe_output.lower()
         if "pairing successful" in lowered or "already exists" in lowered or "already paired" in lowered:
             logger.info("BlueZ pairing/trust completed for %s", safe_token)
-        elif "authentication" in lowered or "pin" in lowered or "passkey" in lowered:
-            logger.warning(
-                "BlueZ pairing for %s may still need a PIN/passkey. Pairing output: %s",
-                safe_token,
-                compact[-500:],
-            )
-        else:
-            logger.debug("BlueZ pairing output for %s: %s", safe_token, compact[-500:])
+            return
+        if "authentication" in lowered or "pin" in lowered or "passkey" in lowered or "failed to pair" in lowered:
+            raise RuntimeError(f"BlueZ pairing failed for {safe_token}. Pairing output: {compact[-500:]}")
+        logger.debug("BlueZ pairing output for %s: %s", safe_token, compact[-500:])
 
     @staticmethod
     def _run_bluetoothctl_pair_session(address: str, *, pin: str = "", timeout: float = 45.0) -> str:
@@ -1895,7 +1977,12 @@ class MeshtasticBridgeService:
             return "".join(chunk_parts)
 
         def send(line: str) -> None:
-            os.write(master_fd, f"{line}\n".encode("utf-8"))
+            if proc.poll() is not None:
+                raise RuntimeError("bluetoothctl exited before pairing completed")
+            try:
+                os.write(master_fd, f"{line}\n".encode("utf-8"))
+            except OSError as exc:
+                raise RuntimeError("bluetoothctl session closed before pairing completed") from exc
 
         try:
             deadline = time.monotonic() + max(15.0, float(timeout or 45.0))

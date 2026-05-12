@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -2341,7 +2342,12 @@ class MeshtasticBridgeService:
 
     def _add_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         stored = self.events.add(event)
-        self.database.record_event(stored)
+        try:
+            self.database.record_event(stored)
+        except sqlite3.Error as exc:
+            friendly = f"Could not write Meshtastic event to SQLite: {_compact_exception_message(exc)}"
+            logger.error(friendly)
+            self._set_state(connected=bool(self.connected), state=self.connection_state, error=friendly)
         return stored
 
     def _on_connection_established(self, interface: Any = None, topic: Any = None) -> None:

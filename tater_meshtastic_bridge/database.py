@@ -30,17 +30,26 @@ def _row_value(row: Optional[sqlite3.Row], key: str, default: Any = None) -> Any
 class BridgeDatabase:
     def __init__(self, path: str) -> None:
         self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        except sqlite3.OperationalError as exc:
+            raise sqlite3.OperationalError(
+                f"{exc}; database_path={self.path}; parent={self.path.parent}"
+            ) from exc
+        except OSError as exc:
+            raise sqlite3.OperationalError(
+                f"{exc}; database_path={self.path}; parent={self.path.parent}"
+            ) from exc
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as conn:

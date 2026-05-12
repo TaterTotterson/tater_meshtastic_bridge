@@ -1776,8 +1776,7 @@ class MeshtasticBridgeService:
                     MeshtasticBridgeService._close_timed_out_ble_client(client)
                     if self.settings.ble_pair and not retried_auth and self._exception_looks_like_bluetooth_auth(exc):
                         retried_auth = True
-                        logger.warning("BlueZ authentication failed for %s; removing stale bond and retrying once", device.address)
-                        self._linux_bluez_remove_device(device.address)
+                        logger.warning("BlueZ authentication failed for %s; forcing fresh pairing and retrying once", device.address)
                         self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout)
                         self._linux_bluez_disconnect_device(device.address)
                         continue
@@ -1850,38 +1849,6 @@ class MeshtasticBridgeService:
         return ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
 
     @staticmethod
-    def _linux_bluez_device_flags(address: str) -> Tuple[bool, bool]:
-        try:
-            output = MeshtasticBridgeService._run_bluetoothctl_command("info", address, timeout=5)
-        except FileNotFoundError:
-            raise
-        except Exception as exc:
-            logger.debug("Unable to read BlueZ device info for %s: %s", address, _compact_exception_message(exc))
-            return False, False
-
-        paired = False
-        trusted = False
-        for raw_line in output.splitlines():
-            line = raw_line.strip().lower()
-            if line.startswith("paired:"):
-                paired = line.split(":", 1)[1].strip() == "yes"
-            elif line.startswith("trusted:"):
-                trusted = line.split(":", 1)[1].strip() == "yes"
-        return paired, trusted
-
-    @staticmethod
-    def _linux_bluez_trust_device(address: str) -> None:
-        try:
-            output = MeshtasticBridgeService._run_bluetoothctl_command("trust", address, timeout=5)
-        except FileNotFoundError:
-            raise
-        except Exception as exc:
-            logger.debug("Unable to trust BlueZ device %s: %s", address, _compact_exception_message(exc))
-            return
-        compact = " ".join(output.split())
-        logger.debug("BlueZ trust check for %s: %s", address, compact or "ok")
-
-    @staticmethod
     def _linux_bluez_remove_device(address: Any) -> None:
         if not sys.platform.startswith("linux"):
             return
@@ -1907,16 +1874,11 @@ class MeshtasticBridgeService:
             return
         pin = str(pin or "").strip()
         safe_token = token
-        logger.info("Preparing Linux BLE pairing/trust for %s", safe_token)
+        logger.info("Preparing fresh Linux BLE pairing/trust for %s", safe_token)
 
         try:
-            paired, trusted = MeshtasticBridgeService._linux_bluez_device_flags(token)
-            if paired:
-                if not trusted:
-                    MeshtasticBridgeService._linux_bluez_trust_device(token)
-                logger.info("BlueZ device %s is already paired; skipping pairing prompt", safe_token)
-                return
-
+            MeshtasticBridgeService._linux_bluez_disconnect_device(token)
+            MeshtasticBridgeService._linux_bluez_remove_device(token)
             output = MeshtasticBridgeService._run_bluetoothctl_pair_session(
                 token,
                 pin=pin,

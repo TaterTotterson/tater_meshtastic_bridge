@@ -3179,12 +3179,12 @@ function renderSettings() {
                 <option value="false" ${selectedAttr(Boolean(values.ble_pair), false)}>False</option>
                 <option value="true" ${selectedAttr(Boolean(values.ble_pair), true)}>True</option>
               </select>
-              ${settingHelper("ble_pair", sources, "Enable if Linux needs a PIN prompt before the radio config handshake completes.")}
+              ${settingHelper("ble_pair", sources, "On Linux, remove any stale BlueZ bond and pair fresh before each BLE connection.")}
             </div>
             <div class="field">
               <label for="runtime-ble-pin">BLE Pairing PIN</label>
               <input id="runtime-ble-pin" name="ble_pin" value="${escapeHtml(values.ble_pin || "")}" inputmode="numeric" autocomplete="off" placeholder="123456" />
-              ${settingHelper("ble_pin", sources, "Optional. Used by the Linux pairing helper when Pair On BLE Connect is enabled.")}
+              ${settingHelper("ble_pin", sources, "Used by the Linux pairing helper when Pair On BLE Connect is enabled.")}
             </div>
             <div class="field runtime-scan-field">
               ${renderBleScanPanel(values)}

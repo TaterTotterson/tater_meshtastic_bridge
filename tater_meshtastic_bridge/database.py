@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import sqlite3
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 def _json_dump(value: Any) -> str:
@@ -30,17 +31,22 @@ def _row_value(row: Optional[sqlite3.Row], key: str, default: Any = None) -> Any
 class BridgeDatabase:
     def __init__(self, path: str) -> None:
         self.path = Path(path).expanduser()
+        self._conn: Optional[sqlite3.Connection] = None
         self._lock = Lock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if self._conn is not None:
+            return self._conn
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self.path), check_same_thread=False)
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            self._conn = conn
             return conn
         except sqlite3.OperationalError as exc:
             raise sqlite3.OperationalError(
@@ -51,8 +57,15 @@ class BridgeDatabase:
                 f"{exc}; database_path={self.path}; parent={self.path.parent}"
             ) from exc
 
+    @contextmanager
+    def _session(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                yield conn
+
     def _init_db(self) -> None:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -135,7 +148,7 @@ class BridgeDatabase:
             )
 
     def next_event_id(self) -> int:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             row = conn.execute("SELECT COALESCE(MAX(event_id), 0) AS value FROM events").fetchone()
         return int(row["value"] if row is not None else 0) + 1
 
@@ -162,7 +175,7 @@ class BridgeDatabase:
             str(payload.get("text") or ""),
             _json_dump(payload),
         )
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO events (
@@ -206,7 +219,7 @@ class BridgeDatabase:
         short_name = str(node.get("short_name") or node.get("shortName") or "").strip()
         payload_json = _json_dump(payload)
 
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 INSERT INTO node_registry (
@@ -279,7 +292,7 @@ class BridgeDatabase:
                 "ORDER BY event_id DESC LIMIT ?"
                 ") ORDER BY event_id ASC"
             )
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(query, params).fetchall()
         return [_json_load(row["payload_json"], {}) for row in rows]
 
@@ -287,7 +300,7 @@ class BridgeDatabase:
         return self.list_events(since_id=since_id, since_ts=since_ts, limit=limit, event_type="message")
 
     def list_known_nodes(self, *, limit: int = 500) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 """
                 SELECT node_id, num, long_name, short_name, first_seen, last_seen,
@@ -317,7 +330,7 @@ class BridgeDatabase:
         token = str(node_id or "").strip()
         if not token:
             return []
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 """
                 SELECT timestamp, event_type, num, long_name, short_name, payload_json
@@ -345,7 +358,7 @@ class BridgeDatabase:
         if not token:
             return
         payload_json = _json_dump(payload)
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 INSERT INTO snapshots (kind, timestamp, payload_json)
@@ -368,7 +381,7 @@ class BridgeDatabase:
         token = str(kind or "").strip()
         if not token:
             return {}
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             row = conn.execute(
                 "SELECT timestamp, payload_json FROM snapshots WHERE kind = ?",
                 (token,),
@@ -385,7 +398,7 @@ class BridgeDatabase:
         token = str(kind or "").strip()
         if not token:
             return []
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 """
                 SELECT timestamp, payload_json
@@ -406,7 +419,7 @@ class BridgeDatabase:
         ]
 
     def record_audit(self, *, timestamp: str, action: str, target: str, status: str, details: Dict[str, Any]) -> None:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 INSERT INTO audit_log (timestamp, action, target, status, details_json)
@@ -422,7 +435,7 @@ class BridgeDatabase:
             )
 
     def list_audit(self, *, limit: int = 100) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(
                 """
                 SELECT id, timestamp, action, target, status, details_json
@@ -445,13 +458,13 @@ class BridgeDatabase:
         ]
 
     def get_bridge_settings(self) -> Dict[str, Any]:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute("SELECT key, value_json FROM bridge_settings ORDER BY key ASC").fetchall()
         return {str(row["key"] or ""): _json_load(row["value_json"], None) for row in rows if str(row["key"] or "").strip()}
 
     def save_bridge_settings(self, values: Dict[str, Any], *, timestamp: str) -> None:
         payload = dict(values or {})
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             for key, value in payload.items():
                 token = str(key or "").strip()
                 if not token:
@@ -468,7 +481,7 @@ class BridgeDatabase:
                 )
 
     def clear_bridge_settings(self) -> int:
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             cursor = conn.execute("DELETE FROM bridge_settings")
             return int(cursor.rowcount or 0)
 
@@ -483,7 +496,7 @@ class BridgeDatabase:
             "bridge_settings",
         )
         cleared: Dict[str, int] = {}
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             for table in tables:
                 cursor = conn.execute(f"DELETE FROM {table}")
                 cleared[table] = int(cursor.rowcount or 0)
@@ -494,7 +507,7 @@ class BridgeDatabase:
 
     def stats_summary(self, *, window_hours: int = 24) -> Dict[str, Any]:
         hours = max(1, int(window_hours))
-        with self._lock, self._connect() as conn:
+        with self._session() as conn:
             totals = conn.execute(
                 """
                 SELECT

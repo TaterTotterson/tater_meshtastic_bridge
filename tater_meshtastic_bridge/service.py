@@ -1903,7 +1903,7 @@ class MeshtasticBridgeService:
         safe_output = output.replace(pin, "******") if pin else output
         compact = " ".join(safe_output.split())
         lowered = safe_output.lower()
-        if "pairing successful" in lowered or "already exists" in lowered or "already paired" in lowered:
+        if "pairing successful" in lowered or "paired: yes" in lowered or "already exists" in lowered or "already paired" in lowered:
             logger.info("BlueZ pairing/trust completed for %s", safe_token)
             return
         if "authentication" in lowered or "pin" in lowered or "passkey" in lowered or "failed to pair" in lowered:
@@ -1958,15 +1958,25 @@ class MeshtasticBridgeService:
         try:
             deadline = time.monotonic() + max(15.0, float(timeout or 45.0))
             read_available(0.3)
-            for command in ("agent KeyboardDisplay", "default-agent"):
+            for command in ("power on", "agent KeyboardDisplay", "default-agent", "scan on"):
                 send(command)
                 time.sleep(0.2)
                 read_available(0.2)
+
+            address_token = address.lower()
+            scan_deadline = min(deadline, time.monotonic() + 12.0)
+            while time.monotonic() < scan_deadline:
+                output = read_available(0.3)
+                if address_token in "".join(output_parts).lower():
+                    break
+                if "not available" in output.lower() and time.monotonic() + 1.0 < scan_deadline:
+                    continue
 
             send(f"pair {address}")
             sent_pin_at = -1
             sent_yes_at = -1
             pair_done = False
+            not_available_at = -1
             while time.monotonic() < deadline:
                 read_available(0.2)
                 output = "".join(output_parts)
@@ -1991,8 +2001,17 @@ class MeshtasticBridgeService:
                     send("yes")
                     sent_yes_at = output_len
                     continue
+                not_available_tail = lowered[max(not_available_at, 0) :]
+                if "not available" in not_available_tail and time.monotonic() + 2.0 < deadline:
+                    not_available_at = output_len
+                    send("scan on")
+                    time.sleep(1.0)
+                    read_available(0.2)
+                    send(f"pair {address}")
+                    continue
                 if (
                     "pairing successful" in lowered
+                    or "paired: yes" in lowered
                     or "failed to pair" in lowered
                     or "already exists" in lowered
                     or "already paired" in lowered
@@ -2002,9 +2021,14 @@ class MeshtasticBridgeService:
                     pair_done = True
                     break
             if not pair_done:
-                raise TimeoutError(f"Timed out waiting {int(timeout)}s for bluetoothctl pairing to finish")
+                output = "".join(output_parts)
+                safe_output = output.replace(pin, "******") if pin else output
+                compact = " ".join(safe_output.split())
+                raise TimeoutError(
+                    f"Timed out waiting {int(timeout)}s for bluetoothctl pairing to finish. Output tail: {compact[-700:]}"
+                )
 
-            for command in (f"trust {address}", f"disconnect {address}", "quit"):
+            for command in ("scan off", f"trust {address}", f"disconnect {address}", "quit"):
                 send(command)
                 time.sleep(0.2)
                 read_available(0.2)

@@ -389,6 +389,7 @@ class MeshtasticBridgeService:
         self._broadcast_addr = "^all"
         self._broadcast_num = 0xFFFFFFFF
         self._snapshot_cache: Dict[str, Dict[str, Any]] = {}
+        self._linux_ble_prepared_address = ""
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -1746,8 +1747,11 @@ class MeshtasticBridgeService:
                 raise interface_cls.BLEError(
                     f"Timed out scanning for Meshtastic BLE devices after {operation_timeout:.0f}s"
                 ) from exc
-            if self.settings.ble_pair:
-                self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout)
+            if self.settings.ble_pair and self._linux_ble_prepared_address != str(device.address):
+                self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout, fresh=True)
+                self._linux_ble_prepared_address = str(device.address)
+            elif self.settings.ble_pair:
+                logger.debug("BlueZ pairing already prepared for %s in this bridge run", device.address)
             self._linux_bluez_disconnect_device(device.address)
             client_kwargs: Dict[str, Any] = {
                 "disconnected_callback": lambda _: interface_self.close(),
@@ -1777,7 +1781,9 @@ class MeshtasticBridgeService:
                     if self.settings.ble_pair and not retried_auth and self._exception_looks_like_bluetooth_auth(exc):
                         retried_auth = True
                         logger.warning("BlueZ authentication failed for %s; forcing fresh pairing and retrying once", device.address)
-                        self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout)
+                        self._linux_ble_prepared_address = ""
+                        self._linux_bluez_pair_device(device.address, pin=self.settings.ble_pin, timeout=operation_timeout, fresh=True)
+                        self._linux_ble_prepared_address = str(device.address)
                         self._linux_bluez_disconnect_device(device.address)
                         continue
                     raise
@@ -1866,7 +1872,7 @@ class MeshtasticBridgeService:
         logger.info("Removed stale BlueZ bond for %s: %s", token, compact or "ok")
 
     @staticmethod
-    def _linux_bluez_pair_device(address: Any, *, pin: str = "", timeout: float = 45.0) -> None:
+    def _linux_bluez_pair_device(address: Any, *, pin: str = "", timeout: float = 45.0, fresh: bool = False) -> None:
         if not sys.platform.startswith("linux"):
             return
         token = str(address or "").strip()
@@ -1874,11 +1880,13 @@ class MeshtasticBridgeService:
             return
         pin = str(pin or "").strip()
         safe_token = token
-        logger.info("Preparing fresh Linux BLE pairing/trust for %s", safe_token)
+        action = "fresh " if fresh else ""
+        logger.info("Preparing %sLinux BLE pairing/trust for %s", action, safe_token)
 
         try:
-            MeshtasticBridgeService._linux_bluez_disconnect_device(token)
-            MeshtasticBridgeService._linux_bluez_remove_device(token)
+            if fresh:
+                MeshtasticBridgeService._linux_bluez_disconnect_device(token)
+                MeshtasticBridgeService._linux_bluez_remove_device(token)
             output = MeshtasticBridgeService._run_bluetoothctl_pair_session(
                 token,
                 pin=pin,

@@ -3179,7 +3179,7 @@ function renderSettings() {
                 <option value="false" ${selectedAttr(Boolean(values.ble_pair), false)}>False</option>
                 <option value="true" ${selectedAttr(Boolean(values.ble_pair), true)}>True</option>
               </select>
-              ${settingHelper("ble_pair", sources, "On Linux, remove any stale BlueZ bond and pair fresh before each BLE connection.")}
+              ${settingHelper("ble_pair", sources, "On Linux, pair fresh once per bridge run, then reuse that bond for reconnects.")}
             </div>
             <div class="field">
               <label for="runtime-ble-pin">BLE Pairing PIN</label>

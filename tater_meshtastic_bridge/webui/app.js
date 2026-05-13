@@ -51,6 +51,7 @@ const state = {
   },
   notice: null,
   pollTimer: 0,
+  chatPollInFlight: false,
   loading: false,
   lastLoadedAt: "",
   lastBootstrapPollAt: 0,
@@ -81,6 +82,8 @@ const ROOT_PATH = (() => {
 })();
 const API_BASE = `${ROOT_PATH}/api`;
 const MAX_CHAT_MESSAGES = 500;
+const CHAT_POLL_INTERVAL_MS = 2000;
+const BACKGROUND_BOOTSTRAP_INTERVAL_MS = 15000;
 const LORA_REGION_FALLBACK_OPTIONS = [
   "UNSET",
   "US",
@@ -803,6 +806,36 @@ function chatIsNearBottom(element) {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 80;
 }
 
+function captureChatComposerDraft() {
+  const input = document.getElementById("mesh-chat-input");
+  if (!(input instanceof HTMLTextAreaElement)) {
+    return null;
+  }
+  return {
+    value: input.value,
+    selectionStart: input.selectionStart,
+    selectionEnd: input.selectionEnd,
+    focused: document.activeElement === input,
+  };
+}
+
+function restoreChatComposerDraft(draft) {
+  if (!draft) {
+    return;
+  }
+  const input = document.getElementById("mesh-chat-input");
+  if (!(input instanceof HTMLTextAreaElement)) {
+    return;
+  }
+  input.value = draft.value;
+  const start = Number.isFinite(draft.selectionStart) ? draft.selectionStart : input.value.length;
+  const end = Number.isFinite(draft.selectionEnd) ? draft.selectionEnd : start;
+  input.setSelectionRange(start, end);
+  if (draft.focused) {
+    input.focus();
+  }
+}
+
 function stickCurrentChatToBottom() {
   const scrollToBottom = () => {
     const element = chatLogElement();
@@ -820,8 +853,10 @@ function renderChatWithScroll({ forceBottom = false } = {}) {
   const currentLog = chatLogElement();
   const shouldStick = forceBottom || chatIsNearBottom(currentLog);
   const bottomOffset = currentLog ? currentLog.scrollHeight - currentLog.scrollTop : 0;
+  const composerDraft = captureChatComposerDraft();
   renderView();
   renderNodeModal();
+  restoreChatComposerDraft(composerDraft);
   const nextLog = chatLogElement();
   if (!nextLog) {
     return;
@@ -845,7 +880,11 @@ function handleChatComposerKeydown(event) {
   target.closest("form")?.requestSubmit();
 }
 
-async function pollChatMessages() {
+async function pollChatMessages({ force = false } = {}) {
+  if (state.chatPollInFlight || (!force && document.hidden)) {
+    return;
+  }
+  state.chatPollInFlight = true;
   const sinceId = state.latestMessageEventId || latestMessageEventId(state.data.messages);
   try {
     const payload = await apiFetch(`/messages?since_id=${encodeURIComponent(sinceId)}&limit=200`);
@@ -860,6 +899,8 @@ async function pollChatMessages() {
   } catch (error) {
     setNotice(error.message || "Failed to load new chat messages.", "error");
     renderNotice();
+  } finally {
+    state.chatPollInFlight = false;
   }
 }
 
@@ -4237,6 +4278,7 @@ function installEventHandlers() {
       state.formDirty = false;
       render();
       if (state.view === "chat") {
+        await pollChatMessages({ force: true });
         stickCurrentChatToBottom();
       }
       if (state.view === "firmware") {
@@ -4389,12 +4431,38 @@ function startPolling() {
     window.clearInterval(state.pollTimer);
     state.pollTimer = 0;
   }
+  state.pollTimer = window.setInterval(() => {
+    if (state.view === "chat") {
+      pollChatMessages().catch((error) => {
+        setNotice(error.message || "Failed to load new chat messages.", "error");
+      });
+      return;
+    }
+    if (Date.now() - state.lastBootstrapPollAt < BACKGROUND_BOOTSTRAP_INTERVAL_MS) {
+      return;
+    }
+    loadBootstrap({ force: false }).catch((error) => {
+      setNotice(error.message || "Failed to refresh bridge data.", "error");
+    });
+  }, CHAT_POLL_INTERVAL_MS);
+}
+
+function installVisibilityHandlers() {
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.view === "chat") {
+      pollChatMessages({ force: true }).catch((error) => {
+        setNotice(error.message || "Failed to load new chat messages.", "error");
+      });
+    }
+  });
 }
 
 async function boot() {
   installEventHandlers();
+  installVisibilityHandlers();
   render();
   await loadBootstrap();
+  startPolling();
 }
 
 window.addEventListener("DOMContentLoaded", () => {
